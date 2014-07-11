@@ -1,0 +1,174 @@
+/**
+
+@page vsm_user_guide Ardupilot VSM User Guide
+
+@image latex ugcs-logo.png "" width=3cm
+@image latex main-vsm-logo.png "" width=3cm
+
+
+@section first_time_connecton First time vehicle connection
+
+See @ref vsm_disclaimer.
+
+Please follow these steps to connect an Ardupilot vehicle to the UgCS:
+
+1. Ardupilot vehicle must be properly configured, calibrated and
+tested using tools and instruction from the official
+[Ardupilot web site](http://www.ardupilot.com) prior to using it with UgCS.
+UgCS does not support initial configuration, setup and calibration of Ardupilot
+driven vehicles.
+
+2. If more than one Ardupilot vehicle is planned to be used with UgCS, it must
+be ensured that each vehicle has a unique system id as defined by the parameter
+_SYSID_THISMAV_, otherwise UgCS will not be able to distinguish between different
+vehicles and it will not be possible to operate vehicles normally. To change the
+parameter, please use the official Ardupilot configuration software like Mission
+Planner.
+
+3. Turn on the vehicle and plug in the radio modem paired with the vehicle or
+direct USB cable from the Ardupilot board to the computer where VSM is running.
+UgCS uses serial ports for communication with Ardupilot vehicles. Standard
+communication devices like 3DR radio modems (and their analogs) and direct USB
+connections are supported, as long as OS driver for virtual serial port is
+installed and serial port is successfully created. Please refer to your
+communication equipment manufacturer documentation about driver installation
+instructions.
+
+4. Open _Vehicles_ window in UgCS Client and wait until new vehicle appears there
+automatically. Both Uplink and Downlink connections should be available. Press
+_Edit_ and select corresponding vehicle profile, an image and change the default
+vehicle name and tail number to be convenient for you:
+@image html new-ardu-vehicle.png "New Ardupilot vehicle"
+@image latex new-ardu-vehicle.png "New Ardupilot vehicle" width=15cm
+Vehicle profile needs to be assigned to allow mission planning with this vehicle.
+Image needs to be assigned to see vehicle location on the map.
+
+5. Repeat steps above for each your Ardupilot vehicle.
+
+Supported vehicle types:
+- Copters.
+
+Supported Ardupilot firmware versions:
+- 3.0
+- 3.1.x (recommended)
+
+_Note: ArduCopter version 3.2.x is not yet supported._ 
+
+Supported hardware platforms:
+- APM
+- Pixhawk
+
+_Note: Pixhawk with native firmware is not yet supported._
+
+@section mission_execution_specifics Mission execution specifics
+
+Flight plan element / action | Support | Notes
+-----------------------------|---------|---------
+Change speed    |  Partial | Changing of flight speed during the mission is currently broken for Ardupilot due to firmware bugs.
+Panorama        |  Partial | Only clock-wise movement is supported due to Ardupilot firmware bug. UgCS provides correct angle values according to Mavlink specification.
+Camera control  |  No      |    |
+
+@section command_execution_specifics Command execution specifics
+
+__Copters:__
+Command        | Support  | Notes
+---------------|----------|---------
+ARM            |  Yes     | Arms vehicle. |
+DISARM         |  Yes     | Disarms vehicle. |
+AUTOMODE       |  Yes     | Sets _Auto_ flight mode. |
+MANUALMODE     |  Yes     | Sets _Loiter_ flight mode. |
+RETURNHOME     |  Yes     | |
+TAKEOFF        |  No      | |
+LAND           |  Yes     | |
+EMERGENCYLAND  |  No      | |
+
+__Planes:__
+Command        | Support  | Notes
+---------------|----------|---------
+ARM            |  Yes     | |
+DISARM         |  Yes     | |
+AUTOMODE       |  Yes     | Sets _Auto_ flight mode. |
+MANUALMODE     |  Yes     | Sets _Manual_ flight mode. |
+RETURNHOME     |  Yes     | |
+TAKEOFF        |  No      | |
+LAND           |  No      | |
+EMERGENCYLAND  |  No      | |
+
+__Rovers:__
+Command        | Support  | Notes
+---------------|----------|---------
+ARM            |  No      | |
+DISARM         |  No      | |
+AUTOMODE       |  Yes     | Sets _Auto_ flight mode. |
+MANUALMODE     |  Yes     | Sets _Manual_ flight mode. |
+RETURNHOME     |  Yes     | |
+TAKEOFF        |  No      | |
+LAND           |  No      | |
+EMERGENCYLAND  |  No      | |
+
+@section telemetry_info Telemetry information specifics
+
+Nothing specific.
+
+@section config_file_parameters_section Configuration file
+
+Default configuration file of the Ardupilot VSM suits most needs and it is
+generally not necessary to modify it.
+
+Configuration file location:
+         
+- <b>On Microsoft Windows:</b>
+
+         C:\Program Files (x86)\UgCS\vsm-ardupilot\vsm-ardupilot.conf
+
+- <b>On GNU/Linux:</b>
+
+         /etc/opt/ugcs/vsm-ardupilot.conf
+         
+- <b>On Apple OS X:</b>
+
+          /Users/[user name]/Library/Application Support/UGCS/configuration/vsm-ardupilot.conf
+
+@subsection common_params_section Common parameters
+
+All VSMs share a common set of configuration file parameters described in
+@ref common_config_file_params. Ardupilot VSM configuration file prefix is:
+
+    vehicle.ardupilot
+
+@subsection serial_port_params_vsmspec Serial port configuration
+
+Mandatory. At least one serial port should be configured, otherwise VSM will not
+try to connect to the vehicle.
+
+- @b Name: vehicle.ardupilot.serial_port
+- @b Description: Serial port configuration, for more details see
+@ref serial_port_parameters.
+Default Ardupilot serial port communication speed is 57600 bps.
+- @b Example:
+
+         vehicle.ardupilot.serial_port.1.name = com1
+         vehicle.ardupilot.serial_port.1.baud = 57600
+
+@subsection model_override_params Model name and serial number override
+
+Optional.
+
+- @b Name: vehicle.ardupilot.custom.[name].system_id = [system id]
+- @b Name: vehicle.ardupilot.custom.[name].model_name = [model name]
+- @b Name: vehicle.ardupilot.custom.[name].serial_number = [serial number]
+- @b Description: In UgCS each vehicle is identified by a unique combination of
+model name and serial number represented as text strings. By default, Ardupilot
+vehicles are identified with a model name _Ardupilot_ and serial number equal with
+the Mavlink system id read from the vehicle. It can be overridden by these
+parameters, where [name] is an arbitrary vehicle name, [system id] is the
+original Mavlink system id which should be overridden, [model name] is a new
+model name to be visible to the UgCS, [serial number] is a new serial number to
+be visible to the UgCS.
+- @b Example:
+
+        vehicle.ardupilot.custom.my_drone.system_id = 2
+        vehicle.ardupilot.custom.my_drone.model_name = ArducopterQuad
+        vehicle.ardupilot.custom.my_drone.serial_number = 123456
+
+*/

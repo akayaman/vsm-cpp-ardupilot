@@ -22,12 +22,15 @@ private:
 
     virtual Mavlink_vehicle::Ptr
     Create_mavlink_vehicle(
-            vsm::Mavlink_demuxer::System_id system_id,
-            vsm::Mavlink_demuxer::Component_id component_id,
-            vsm::mavlink::MAV_TYPE type,
-            vsm::Io_stream::Ref stream,
+            ugcs::vsm::Mavlink_demuxer::System_id system_id,
+            ugcs::vsm::Mavlink_demuxer::Component_id component_id,
+            ugcs::vsm::mavlink::MAV_TYPE type,
+            ugcs::vsm::Io_stream::Ref stream,
+            ugcs::vsm::Socket_address::Ptr,
+            ugcs::vsm::Optional<std::string> mission_dump_path,
             std::string serial_number,
-            std::string model_name) override;
+            std::string model_name,
+            bool id_overridden) override;
 
     virtual void
     Register_detectors() override;
