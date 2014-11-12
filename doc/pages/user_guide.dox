@@ -36,8 +36,8 @@ instructions.
 
 4. Open _Vehicles_ window in UgCS Client and wait until new vehicle appears there
 automatically. Both Uplink and Downlink connections should be available. Press
-_Edit_ and select corresponding vehicle profile, an image and change the default
-vehicle name and tail number to be convenient for you:
+_Gain control_ and _Edit_ to select corresponding vehicle profile and change the default
+vehicle name to be convenient for you:
 @image html new-ardu-vehicle.png "New Ardupilot vehicle"
 @image latex new-ardu-vehicle.png "New Ardupilot vehicle" width=15cm
 Vehicle profile needs to be assigned to allow mission planning with this vehicle.
@@ -109,6 +109,32 @@ EMERGENCYLAND  |  No      | |
 @section telemetry_info Telemetry information specifics
 
 Nothing specific.
+
+@section fail-safe Fail-safe actions
+
+__GPS Lost:__
+Action		   |Result
+---------------|-------------------|
+Wait			| Aircraft tries to maintain altitude|
+Land			| Aircraft lands even if in loiter mode|
+
+__RC Lost:__
+Action		   |Result
+---------------|-------------------|
+Wait			| Aircraft lands even if in loiter mode|
+Land			| Aircraft lands even if in loiter mode|
+Return Home			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
+Continue		| Aircaft continues mission|
+
+__Battery Low:__
+Action		   |Result
+---------------|-------------------|
+Wait			| Aircraft lands even if in loiter mode|
+Land			| Aircraft lands even if in loiter mode|
+Return Home			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
+Continue		| Aircaft continues mission|
+
+
 
 @section config_file_parameters_section Configuration file
 

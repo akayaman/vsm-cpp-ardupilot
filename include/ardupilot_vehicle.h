@@ -233,14 +233,6 @@ public:
         virtual void
         On_disable() override;
 
-        /** Calculate launch elevation which is assumed to be the first
-         * waypoint.
-         * @return true on success, false if no sufficient data found in
-         * the mission.
-         */
-        bool
-        Calculate_launch_elevation();
-
         /** Filter unsupported actions. */
         void
         Filter_actions();
@@ -328,13 +320,6 @@ public:
 
         /** Previous move action, if any. */
         ugcs::vsm::Action::Ptr last_move_action;
-
-        /** Elevation (ground level) of the vehicle launch position which is
-         * assumed to be first waypoint. Used to compensate absolute altitude
-         * sent from UCS. It is assumed that vehicle is started 'close enough'
-         * to the first waypoint.
-         */
-        double launch_elevation = 0;
     } task_upload;
 
 private:
@@ -424,6 +409,10 @@ private:
     /** Updates current capabilities based on vehicle type. */
     void
     Update_capabilities();
+
+    /** Updates current capability states based on vehicle type. */
+    void
+    Update_capability_states();
 
     /**
      * Minimal waypoint acceptance radius to use.

@@ -327,20 +327,15 @@ Ardupilot_vehicle::Task_upload::Task_atributes_uploaded(bool success)
         return;
     }
 
+    Prepare_task();
+    vehicle.mission_upload.Disable();
+    vehicle.mission_upload.mission_items = std::move(prepared_actions);
+    vehicle.mission_upload.Set_next_action(
+            Activity::Make_next_action(
+                    &Task_upload::Mission_uploaded,
+                    this));
+    vehicle.mission_upload.Enable();
 
-    if (!Calculate_launch_elevation()) {
-        VEHICLE_LOG_ERR(vehicle, "Unable to calculate launch elevation.");
-        Disable();
-    } else {
-        Prepare_task();
-        vehicle.mission_upload.Disable();
-        vehicle.mission_upload.mission_items = std::move(prepared_actions);
-        vehicle.mission_upload.Set_next_action(
-                Activity::Make_next_action(
-                        &Task_upload::Mission_uploaded,
-                        this));
-        vehicle.mission_upload.Enable();
-    }
 }
 
 void
@@ -364,11 +359,10 @@ Ardupilot_vehicle::Task_upload::Fill_mavlink_mission_item_coords(
 {
     msg->x = (tuple.latitude * 180.0) / M_PI;
     msg->y = (tuple.longitude * 180.0) / M_PI;
-    /* APM treats all altitudes relative to home position, which
-     * is presumably the point of arming (launch), so compensate
-     * absolute altitude sent from UCS by launch point elevation.
+    /* Fixup absolute altitude - make them relative to
+     * take-off altitude.
      */
-    msg->z = tuple.altitude - launch_elevation;
+    msg->z = tuple.altitude - request->Get_takeoff_altitude();
     msg->param4 = (heading * 180.0) / M_PI;
 }
 
@@ -396,26 +390,6 @@ Ardupilot_vehicle::Task_upload::On_disable()
     vehicle.mission_upload.Disable();
     prepared_actions.clear();
     task_attributes.clear();
-}
-
-bool
-Ardupilot_vehicle::Task_upload::Calculate_launch_elevation()
-{
-    for (auto& action: request->actions) {
-        /* The first move or takeoff action. */
-        if (action->Get_type() == Action::Type::MOVE) {
-            Move_action::Ptr move = action->Get_action<Action::Type::MOVE>();
-            launch_elevation = move->elevation;
-            return true;
-        }
-        /* Or first takeoff. */
-        if (action->Get_type() == Action::Type::TAKEOFF) {
-            Takeoff_action::Ptr takeoff = action->Get_action<Action::Type::TAKEOFF>();
-            launch_elevation = takeoff->elevation;
-            return true;
-        }
-    }
-    return false;
 }
 
 void
@@ -1107,6 +1081,7 @@ Ardupilot_vehicle::Process_heartbeat(
             std::chrono::steady_clock::now() - recent_connect);
 
     Set_system_status(Sys_status(true, true, control_mode, state, uptime));
+    Update_capability_states();
 }
 
 Vehicle::Sys_status::Control_mode
@@ -1213,4 +1188,40 @@ Ardupilot_vehicle::Update_capabilities()
     }
     /* Others don't support anything. */
     Set_capabilities(Capabilities());
+}
+
+void
+Ardupilot_vehicle::Update_capability_states()
+{
+    Capability_states states;
+    auto status = Get_system_status();
+
+    switch (Get_type()) {
+    case Type::COPTER:
+        states.Set(Capability_state::ARM_ENABLED);
+        states.Set(Capability_state::DISARM_ENABLED);
+        if (status.state == Sys_status::State::ARMED) {
+            states.Set(Capability_state::AUTO_MODE_ENABLED);
+            states.Set(Capability_state::MANUAL_MODE_ENABLED);
+            states.Set(Capability_state::RETURN_HOME_ENABLED);
+            states.Set(Capability_state::LAND_ENABLED);
+        }
+        break;
+    case Type::PLANE:
+        states.Set(Capability_state::ARM_ENABLED);
+        states.Set(Capability_state::DISARM_ENABLED);
+        if (status.state == Sys_status::State::ARMED) {
+            states.Set(Capability_state::AUTO_MODE_ENABLED);
+            states.Set(Capability_state::MANUAL_MODE_ENABLED);
+            states.Set(Capability_state::RETURN_HOME_ENABLED);
+        }
+        break;
+    case Type::ROVER:
+        states.Set(Capability_state::AUTO_MODE_ENABLED);
+        states.Set(Capability_state::MANUAL_MODE_ENABLED);
+        states.Set(Capability_state::RETURN_HOME_ENABLED);
+        break;
+    case Type::OTHER:;
+    }
+    Set_capability_states(states);
 }
