@@ -42,6 +42,17 @@ Ardupilot_vehicle_manager::Register_detectors()
                     ugcs::vsm::Optional<std::string>()),
                     Shared_from_this());
 
+    /* Bind a detector to all configured UDP addresses/ports.
+     */
+    Transport_detector::Get_instance()->Add_detector(
+            config_prefix + ".udp",
+            ugcs::vsm::Transport_detector::Make_connect_handler(
+                    &Ardupilot_vehicle_manager::Handle_new_connection,
+                    Shared_from_this(),
+                    ugcs::vsm::Optional<std::string>(),
+                    ugcs::vsm::Optional<std::string>()),
+                    Shared_from_this());
+
     /* Patterns below are known to appear during Ardupilot booting process. */
     Add_timeout_extension_pattern(regex::regex("Init Ardu"));
     Add_timeout_extension_pattern(regex::regex("Free RAM:"));

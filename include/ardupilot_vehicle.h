@@ -27,7 +27,7 @@ public:
                     system_id, component_id, type,
                     ugcs::vsm::mavlink::MAV_AUTOPILOT::MAV_AUTOPILOT_ARDUPILOTMEGA,
                     Vehicle::Capabilities(),
-                    stream, mission_dump_path, 0, std::forward<Args>(args)...),
+                    stream, mission_dump_path, std::forward<Args>(args)...),
             vehicle_command(*this),
             task_upload(*this)
     {
