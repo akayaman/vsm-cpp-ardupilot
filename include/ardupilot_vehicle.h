@@ -33,6 +33,7 @@ public:
     {
         /* Consider this as uptime start. */
         recent_connect = std::chrono::steady_clock::now();
+        Configure();
         Update_capabilities();
     }
 
@@ -219,11 +220,35 @@ public:
 
         void
         Prepare_camera_control(ugcs::vsm::Action::Ptr&);
+
+        void
+        Prepare_camera_series_by_distance(ugcs::vsm::Action::Ptr&);
+
+        void
+        Prepare_camera_series_by_time(ugcs::vsm::Action::Ptr&);
+
+        void
+        Prepare_camera_trigger(ugcs::vsm::Action::Ptr&);
         //@}
 
         /** Build waypoint mission item based on move action. */
         ugcs::vsm::mavlink::Pld_mission_item::Ptr
         Build_wp_mission_item(ugcs::vsm::Action::Ptr&);
+
+        /** Build ROI mission item based on given coordinates */
+        ugcs::vsm::mavlink::Pld_mission_item::Ptr
+        Build_roi_mission_item(const ugcs::vsm::Geodetic_tuple& coords);
+
+        /** Build Heading mission item */
+        ugcs::vsm::mavlink::Pld_mission_item::Ptr
+        Build_heading_mission_item(
+                float heading,
+                float speed = 0.0,
+                bool absolute_angle = true,
+                bool clockwise = true);
+
+        void
+        Add_camera_trigger_item();
 
         /** Previous activity is completed, enable class and start task upload. */
         void
@@ -320,6 +345,32 @@ public:
 
         /** Previous move action, if any. */
         ugcs::vsm::Action::Ptr last_move_action;
+
+        /** Active POI from mission. */
+        ugcs::vsm::Optional<ugcs::vsm::Geodetic_tuple> current_mission_poi;
+
+        /** Current heading from mission. */
+        ugcs::vsm::Optional<float> current_mission_heading;
+
+        /** Does current WP have POI action defined in mission*/
+        bool first_mission_poi_set = false;
+
+        /** Mission POI action must be added as it was cancelled by previous actions.*/
+        bool restart_mission_poi = false;
+
+        float current_heading = 0.0;
+
+        float heading_to_this_wp = 0.0;
+
+        /** CAMERA_SERIES_BY_DISTANCE was activated. */
+        bool camera_series_by_dist_active = false,
+        /** CAMERA_SERIES_BY_DISTANCE was activated in current waypoint. */
+             camera_series_by_dist_active_in_wp = false,
+        /** CAMERA_SERIES_BY_TIME was activated. */
+             camera_series_by_time_active = false,
+        /** CAMERA_SERIES_BY_DISTANCE was activated in current waypoint. */
+             camera_series_by_time_active_in_wp = false;
+
     } task_upload;
 
 private:
@@ -414,6 +465,10 @@ private:
     void
     Update_capability_states();
 
+    /** Load parameters from configuration. */
+    void
+    Configure();
+
     /**
      * Minimal waypoint acceptance radius to use.
      */
@@ -421,6 +476,20 @@ private:
 
     /** Recent connect time of the vehicle. */
     std::chrono::steady_clock::time_point recent_connect;
+
+    /** Index of servo to use for camera trigger. */
+    int camera_servo_idx;
+    /** PWM value to set for camera trigger. */
+    int camera_servo_pwm;
+    /** Time to hold camera servo at the specified PWM when triggering. */
+    float camera_servo_time;
+
+    /** If vehicle does not support ROI for multiple WPts then VSM must
+     * generate POI commands for each WP until POI(none) received.
+     * Leave it true for now until VSM is able to detect Ardupilot FW version.
+     * Pre 3.2 needs POI for each WP
+     * 3.2+ will keep pointing to current poi POI until POI(0,0,0) received.*/
+    bool auto_generate_mission_poi = true;
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */

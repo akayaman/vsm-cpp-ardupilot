@@ -50,61 +50,67 @@ Supported vehicle types:
 
 Supported Ardupilot firmware versions:
 - 3.0
-- 3.1.x (recommended)
-
-_Note: ArduCopter version 3.2.x is not yet supported._ 
+- 3.1.x
+- 3.2.x (recommended)
 
 Supported hardware platforms:
 - APM
 - Pixhawk
 
-_Note: Pixhawk with native firmware is not yet supported._
+_Note: Pixhawk with PX4 autopilot is not supported._
 
 @section mission_execution_specifics Mission execution specifics
 
+__Mission action support:__
 Flight plan element / action | Support | Notes
 -----------------------------|---------|---------
 Change speed    |  Partial | Changing of flight speed during the mission is currently broken for Ardupilot due to firmware bugs.
 Panorama        |  Partial | Only clock-wise movement is supported due to Ardupilot firmware bug. UgCS provides correct angle values according to Mavlink specification.
-Camera control  |  No      |    |
+Set camera mode |  Partial | Only photo mode is supported. |
+Set camera by time | Partial | "First shot delay" parameter is not supported. |
+Set camera by distance | Partial | Only "Distance" parameter is supported. |
+
+__Camera control__
+
+For using camera you should set up necessary parameters in ArduPilot native 
+software according to your hardware configuration. See also @ref camera_control_params
+- VSM configuration should match your copter configuration. See ArduCopter
+manual for details.
+
+For example, in MissionPlanner the camera set up can be done in "Initial setup"
+page "Optional hardware/Camera gimbal/Shutter" section. Select the channel your
+shutter is connected to and set other parameters depending on your shutter
+control hardware.
+
+__Home Location__
+
+@warning Home location set via mission is ignored by Ardupilot.
+
+Ardupilot will always override home location with current position at the time of arming.<br>
+When "RETURN_HOME" command is issued from UgCS Client or RC transmitter, vehicle will return to launch location regardless of home location set in mission.
+
 
 @section command_execution_specifics Command execution specifics
 
-__Copters:__
 Command        | Support  | Notes
 ---------------|----------|---------
 ARM            |  Yes     | Arms vehicle. |
 DISARM         |  Yes     | Disarms vehicle. |
 AUTOMODE       |  Yes     | Sets _Auto_ flight mode. |
 MANUALMODE     |  Yes     | Sets _Loiter_ flight mode. |
-RETURNHOME     |  Yes     | |
+RETURNHOME     |  Yes     | Vehicle will return to launch location regardless of home location set in mission. |
 TAKEOFF        |  No      | |
 LAND           |  Yes     | |
 EMERGENCYLAND  |  No      | |
 
-__Planes:__
-Command        | Support  | Notes
----------------|----------|---------
-ARM            |  Yes     | |
-DISARM         |  Yes     | |
-AUTOMODE       |  Yes     | Sets _Auto_ flight mode. |
-MANUALMODE     |  Yes     | Sets _Manual_ flight mode. |
-RETURNHOME     |  Yes     | |
-TAKEOFF        |  No      | |
-LAND           |  No      | |
-EMERGENCYLAND  |  No      | |
+@section commands_shading Command shading
+UGCS Client can show command buttons in different shades. You can always press all buttons disregarding of shade. Highlighted buttons suggest recommended commands, depending on vehicle current status.
 
-__Rovers:__
-Command        | Support  | Notes
----------------|----------|---------
-ARM            |  No      | |
-DISARM         |  No      | |
-AUTOMODE       |  Yes     | Sets _Auto_ flight mode. |
-MANUALMODE     |  Yes     | Sets _Manual_ flight mode. |
-RETURNHOME     |  Yes     | |
-TAKEOFF        |  No      | |
-LAND           |  No      | |
-EMERGENCYLAND  |  No      | |
+__Command shading:__
+State		| Button highlighted | Button shaded |
+------------|--------------------|---------------
+Armed		| DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME | ARM |
+Disarmed	| ARM | DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME |
 
 @section telemetry_info Telemetry information specifics
 
@@ -121,19 +127,31 @@ Land			| Aircraft lands even if in loiter mode|
 __RC Lost:__
 Action		   |Result
 ---------------|-------------------|
-Wait			| Aircraft lands even if in loiter mode|
+Wait			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
 Land			| Aircraft lands even if in loiter mode|
-Return Home			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
+Return Home		| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
 Continue		| Aircaft continues mission|
 
 __Battery Low:__
 Action		   |Result
 ---------------|-------------------|
-Wait			| Aircraft lands even if in loiter mode|
-Land			| Aircraft lands even if in loiter mode|
-Return Home			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
+Wait			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
+Land			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
+Return Home		| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
 Continue		| Aircaft continues mission|
 
+@section turn_type_specifics Waypoint turn types
+
+There are 2 different routing planning modes for Ardupilot autopilots: Straight waypoint and Spline waypoint. You can choose turn type for each Waypoint, Circle, Perimeter. The default turn mode in the system is Straight type.
+@image html turn-mode.png "Turn type"
+@image latex turn-mode.png "Turn type" width=10cm
+
+Turn type          | Support  | Notes
+-------------------|----------|---------
+Straight           |  Yes     | The vehicle will fly a straight line to the location specified as a lat, lon and altitude. |
+Spline             |  Yes     | The vehicle will fly to the location specified as a lat, lon and altitude, but when executed the vehicle will fly smooth paths (both vertically and horizontally) instead of straight lines. |
+
+You can find more information about turning mode and supporting autopilots on the site https://github.com/diydrones/apm_planner/issues/274, http://copter.ardupilot.com/wiki/mission-command-list/#spline_waypoint.
 
 
 @section config_file_parameters_section Configuration file
@@ -145,7 +163,7 @@ Configuration file location:
          
 - <b>On Microsoft Windows:</b>
 
-         C:\Program Files (x86)\UgCS\vsm-ardupilot\vsm-ardupilot.conf
+         C:\Program Files (x86)\UgCS\bin\vsm-ardupilot.conf
 
 - <b>On GNU/Linux:</b>
 
@@ -196,5 +214,29 @@ be visible to the UgCS.
         vehicle.ardupilot.custom.my_drone.system_id = 2
         vehicle.ardupilot.custom.my_drone.model_name = ArducopterQuad
         vehicle.ardupilot.custom.my_drone.serial_number = 123456
+
+@subsection camera_control_params Camera control parameters
+
+Mandatory. Read Ardupilot manual about camera triggering configuration to
+understand these parameters. It is assumed that the vehicle is configured
+in "servo" mode (not "relay") for camera triggering.
+
+- @b Name: vehicle.ardupilot.camera_servo_idx
+- @b Description: Index of the servo to use for camera triggering.
+- @b Example:
+
+         vehicle.ardupilot.camera_servo_idx = 8
+         
+- @b Name: vehicle.ardupilot.camera_servo_pwm
+- @b Description: PWM value to set for camera triggering servo when taking photo.
+- @b Example:
+
+         vehicle.ardupilot.camera_servo_pwm = 1900
+         
+- @b Name: vehicle.ardupilot.camera_servo_time
+- @b Description:  Time to hold camera servo at the specified PWM when triggering single photo in seconds.
+- @b Example:
+
+         vehicle.ardupilot.camera_servo_time = 1.0
 
 */

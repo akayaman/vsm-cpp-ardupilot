@@ -69,6 +69,8 @@ Ardupilot_vehicle::Get_type(ugcs::vsm::mavlink::MAV_TYPE type)
     case mavlink::MAV_TYPE::MAV_TYPE_HEXAROTOR:
     case mavlink::MAV_TYPE::MAV_TYPE_OCTOROTOR:
     case mavlink::MAV_TYPE::MAV_TYPE_TRICOPTER:
+    case mavlink::MAV_TYPE::MAV_TYPE_HELICOPTER:
+    case mavlink::MAV_TYPE::MAV_TYPE_COAXIAL:
         return Type::COPTER;
         break;
     case mavlink::MAV_TYPE::MAV_TYPE_FIXED_WING:
@@ -78,6 +80,12 @@ Ardupilot_vehicle::Get_type(ugcs::vsm::mavlink::MAV_TYPE type)
         return Type::ROVER;
         break;
     default:
+        switch (static_cast<mavlink::ugcs::MAV_TYPE>(type)) {
+            case mavlink::ugcs::MAV_TYPE::MAV_TYPE_IRIS:
+                return Type::COPTER;
+            default:
+                break;
+        }
         return Type::OTHER;
     }
 }
@@ -390,6 +398,13 @@ Ardupilot_vehicle::Task_upload::On_disable()
     vehicle.mission_upload.Disable();
     prepared_actions.clear();
     task_attributes.clear();
+    current_mission_poi.Disengage();
+    current_mission_heading.Disengage();
+    last_move_action = nullptr;
+    first_mission_poi_set = false;
+    restart_mission_poi = false;
+    current_heading = 0;
+    heading_to_this_wp = 0;
 }
 
 void
@@ -424,17 +439,6 @@ Ardupilot_vehicle::Task_upload::Filter_copter_actions()
         case Action::Type::CAMERA_TRIGGER:
             VEHICLE_LOG_WRN(vehicle, "CAMERA_TRIGGER action ignored.");
             break;
-#if 0
-        case Action::Type::PANORAMA:
-            VEHICLE_LOG_WRN(vehicle, "PANORAMA action ignored.");
-            break;
-        case Action::Type::POI:
-            VEHICLE_LOG_WRN(vehicle, "POI action ignored.");
-            break;
-        case Action::Type::CHANGE_SPEED:
-            VEHICLE_LOG_WRN(vehicle, "SPEED action ignored.");
-            break;
-#endif
         default:
             iter++;
             continue;
@@ -649,6 +653,24 @@ Ardupilot_vehicle::Task_upload::Prepare_copter_task_attributes()
     }
     task_attributes.push_back(param);
 
+
+    int16_t safe_alt = (request->attributes->safe_altitude - request->Get_takeoff_altitude()) * 100;
+    if (safe_alt == 0) {
+        safe_alt = 1;   // Avoid landing.
+    }
+    /* RTL altitude. */
+    param->param_id = "RTL_ALT";
+    param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT16;
+    param->param_value = safe_alt;
+    task_attributes.push_back(param);
+
+    /* RTL Final altitude. Set to the same as RTL_ALT.
+     * This makes it hover after RTL. 0 would mean land.*/
+    param->param_id = "RTL_ALT_FINAL";
+    param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT16;
+    param->param_value = safe_alt;
+    task_attributes.push_back(param);
+
     /* Don't change yaw during auto mission, because there is an auto-POI
      * feature. Besides that, duplicated waypoints are used to implement
      * actions like panorama, so it is not desirable to change the yaw while
@@ -666,6 +688,10 @@ Ardupilot_vehicle::Task_upload::Prepare_copter_task_attributes()
     task_attributes.push_back(param);
 #endif
 
+    param->param_id = "CAM_TRIGG_TYPE";
+    param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+    param->param_value = 0; /* Servo trigger type. */
+    task_attributes.push_back(param);
 }
 
 void
@@ -726,9 +752,16 @@ Ardupilot_vehicle::Task_upload::Prepare_action(Action::Ptr action)
     case Action::Type::CAMERA_CONTROL:
         VSM_EXCEPTION(Internal_error_exception, "CAMERA_CONTROL action not supported.");
     case Action::Type::CAMERA_TRIGGER:
-        VSM_EXCEPTION(Internal_error_exception, "CAMERA_TRIGGER action not supported.");
+        Prepare_camera_trigger(action);
+        return;
     case Action::Type::TASK_ATTRIBUTES:
         VSM_EXCEPTION(Internal_error_exception, "TASK_ATTRIBUTES action not supported.");
+    case Action::Type::CAMERA_SERIES_BY_TIME:
+        Prepare_camera_series_by_time(action);
+        return;
+    case Action::Type::CAMERA_SERIES_BY_DISTANCE:
+        Prepare_camera_series_by_distance(action);
+        return;
     }
     VSM_EXCEPTION(Internal_error_exception, "Unsupported action [%s]",
             action->Get_name().c_str());
@@ -744,8 +777,72 @@ Ardupilot_vehicle::Task_upload::Add_mission_item(mavlink::Pld_mission_item::Ptr 
 void
 Ardupilot_vehicle::Task_upload::Prepare_move(Action::Ptr& action)
 {
+    /* Turn off camera series if active. */
+    if (!camera_series_by_dist_active_in_wp) {
+        if (camera_series_by_dist_active) {
+
+            camera_series_by_dist_active = false;
+            Camera_series_by_distance_action::Ptr a =
+                action->Get_action<Action::Type::CAMERA_SERIES_BY_DISTANCE>();
+            mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+            (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_CAM_TRIGG_DIST;
+            Add_mission_item(mi);
+        }
+    }
+    if (!camera_series_by_time_active_in_wp) {
+        if (camera_series_by_time_active) {
+            camera_series_by_time_active = false;
+
+            Camera_series_by_time_action::Ptr a =
+                action->Get_action<Action::Type::CAMERA_SERIES_BY_TIME>();
+            mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+            (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
+            (*mi)->param1 = ardu_vehicle.camera_servo_idx;
+            Add_mission_item(mi);
+        }
+    }
+    camera_series_by_dist_active_in_wp = false;
+    camera_series_by_time_active_in_wp = false;
+
+    if (last_move_action) {
+        auto from = last_move_action->Get_action<Action::Type::MOVE>();
+        auto to = action->Get_action<Action::Type::MOVE>();
+        float calculated_heading = from->position.Bearing(to->position);
+        // Handle several waypoints at the same coords.
+        if (!std::isnan(calculated_heading)) {
+            calculated_heading = Normalize_angle_0_2pi(calculated_heading);
+            heading_to_this_wp = calculated_heading;
+        } else {
+            // Use previously calculated heading_to_this_wp.
+        }
+    }
+
+    if (current_mission_poi) {
+        if (!first_mission_poi_set && (ardu_vehicle.auto_generate_mission_poi || restart_mission_poi)) {
+            // Add automatic POI on each consecutive WP.
+            LOG("Set AutoPOI");
+            Add_mission_item(Build_roi_mission_item(*current_mission_poi));
+        }
+    } else {
+        if (current_mission_heading) {
+            // Set current heading as yaw angle.
+            current_heading = *current_mission_heading;
+        } else {
+            // Set heading to next waypoint as yaw angle.
+            current_heading = heading_to_this_wp;
+        }
+        if (last_move_action) {
+            LOG("Set Autoheading to %f", current_heading);
+            Add_mission_item(Build_heading_mission_item(current_heading));
+        }
+    }
+
     Add_mission_item(Build_wp_mission_item(action));
     last_move_action = action;
+
+    restart_mission_poi = false;
+    first_mission_poi_set = false;
+    current_mission_heading.Disengage();
 }
 
 void
@@ -753,8 +850,14 @@ Ardupilot_vehicle::Task_upload::Prepare_wait(Action::Ptr& action)
 {
     /* Create additional waypoint on the current position to wait. */
     if (last_move_action) {
-        auto wp = Build_wp_mission_item(last_move_action);
+        if (!current_mission_poi) {
+            Add_mission_item(Build_heading_mission_item(
+                    Normalize_angle_0_2pi(current_heading)));
+        }
+        first_mission_poi_set = false;
+        restart_mission_poi = true;
         Wait_action::Ptr wa = action->Get_action<Action::Type::WAIT>();
+        auto wp = Build_wp_mission_item(last_move_action);
         (*wp)->param1 = wa->wait_time;
         Add_mission_item(wp);
     } else {
@@ -828,9 +931,14 @@ Ardupilot_vehicle::Task_upload::Prepare_change_speed(Action::Ptr& action)
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_CHANGE_SPEED;
     switch (ardu_vehicle.Get_type()) {
     case Type::COPTER:
-        /* Copters use p1 as navigation speed always. */
+        /* ArduCopter version up to 3.2 use p1 for speed and ignores p2.
+         * ArduCopter version up to 3.2+ use p2 for speed and ignores p1.
+         * So, we set both, here.
+         * Later, if MAV_CMD_DO_CHANGE_SPEED handling changes changes
+         * in ArduPilotwe will need to implement FW version checking.
+         */
         (*mi)->param1 = la->speed;
-        (*mi)->param2 = 0; /* unused */
+        (*mi)->param2 = la->speed;
         break;
     case Type::ROVER:
     default:
@@ -859,14 +967,15 @@ Ardupilot_vehicle::Task_upload::Prepare_set_home(Action::Ptr& action)
 void
 Ardupilot_vehicle::Task_upload::Prepare_POI(Action::Ptr& action)
 {
-    /* Apply only active POI. */
-    if (action->Get_action<Action::Type::POI>()->active) {
-        Poi_action::Ptr pa = action->Get_action<Action::Type::POI>();
-        mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_ROI;
-        (*mi)->param1 = mavlink::MAV_ROI::MAV_ROI_LOCATION;
-        Fill_mavlink_mission_item_coords(*mi, pa->position.Get_geodetic(), 0);
-        Add_mission_item(mi);
+    Poi_action::Ptr pa = action->Get_action<Action::Type::POI>();
+    if (pa->active) {
+        // Set up POI for succeeding waypoints.
+        current_mission_poi = pa->position.Get_geodetic();
+        Add_mission_item(Build_roi_mission_item(*current_mission_poi));
+        first_mission_poi_set = true;
+    } else {
+        // Reset POI. Generate next WPs as heading from now on.
+        current_mission_poi.Disengage();
     }
 }
 
@@ -874,13 +983,68 @@ void
 Ardupilot_vehicle::Task_upload::Prepare_heading(Action::Ptr& action)
 {
     Heading_action::Ptr ha = action->Get_action<Action::Type::HEADING>();
+    Add_mission_item(Build_heading_mission_item(ha->heading));
+    current_heading = ha->heading;
+    current_mission_heading = ha->heading;
+    // Heading action terminates current POI.
+    restart_mission_poi = true;
+}
+
+void
+Ardupilot_vehicle::Task_upload::Prepare_camera_series_by_distance(Action::Ptr& action)
+{
+    Camera_series_by_distance_action::Ptr a =
+        action->Get_action<Action::Type::CAMERA_SERIES_BY_DISTANCE>();
     mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_YAW;
-    (*mi)->param1 = (ha->heading * 180.0) / M_PI;
-    (*mi)->param2 = 0; /* Default auto speed. */
-    (*mi)->param3 = 1; /* clockwise. */
-    (*mi)->param4 = 0; /* absolute angle. */
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_CAM_TRIGG_DIST;
+    (*mi)->param1 = a->interval;
     Add_mission_item(mi);
+    camera_series_by_dist_active = true;
+    camera_series_by_dist_active_in_wp = true;
+}
+
+void
+Ardupilot_vehicle::Task_upload::Prepare_camera_series_by_time(Action::Ptr& action)
+{
+    Camera_series_by_time_action::Ptr a =
+        action->Get_action<Action::Type::CAMERA_SERIES_BY_TIME>();
+    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
+    (*mi)->param1 = ardu_vehicle.camera_servo_idx;
+    (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
+    (*mi)->param3 = a->count ? *a->count : 0xffff;
+    (*mi)->param4 = static_cast<float>(a->interval.count()) / 1000.0;
+    Add_mission_item(mi);
+    camera_series_by_time_active = true;
+    camera_series_by_time_active_in_wp = true;
+}
+
+void
+Ardupilot_vehicle::Task_upload::Prepare_camera_trigger(Action::Ptr& action)
+{
+    Camera_trigger_action::Ptr a =
+        action->Get_action<Action::Type::CAMERA_TRIGGER>();
+    if (a->state != Camera_trigger_action::State::SINGLE_PHOTO &&
+        a->state != Camera_trigger_action::State::SERIAL_PHOTO) {
+
+        return;
+    }
+    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
+    (*mi)->param1 = ardu_vehicle.camera_servo_idx;
+    (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
+    if (a->state == Camera_trigger_action::State::SINGLE_PHOTO) {
+        (*mi)->param3 = 1;
+        (*mi)->param4 = ardu_vehicle.camera_servo_time;
+    } else {
+        (*mi)->param3 = 0xffff;
+        (*mi)->param4 = static_cast<float>(a->interval.count()) / 1000.0;
+        camera_series_by_time_active = true;
+        camera_series_by_time_active_in_wp = true;
+    }
+    Add_mission_item(mi);
+    camera_series_by_time_active = true;
+    camera_series_by_time_active_in_wp = true;
 }
 
 void
@@ -892,129 +1056,116 @@ Ardupilot_vehicle::Task_upload::Prepare_panorama(Action::Ptr& action)
         VEHICLE_LOG_WRN(vehicle, "No previous move action found to generate panorama action, ignored.");
         return;
     }
-    /* Create additional waypoint at the current position with wait to
-     * stabilize before doing panorama. */
-    auto panorama_pre_wait = Build_wp_mission_item(last_move_action);
-    (*panorama_pre_wait)->param1 = 3; /* seconds. */
-    Add_mission_item(panorama_pre_wait);
+//    LOG("Panorama angle=%f, speed=%f, step=%f, delay=%lu",
+//            panorama->angle,
+//            panorama->speed,
+//            panorama->step,
+//            panorama->delay.count()
+//            );
 
     /* Panorama is always done in steps less then 180 degree to make sure that
      * turns over 180 degrees are supported.
      */
-    double min_step = 170;
-    double full_angle = (std::abs(panorama->angle) * 180.0) / M_PI;
-    double speed = (std::abs(panorama->speed) * 180.0) / M_PI;
-    double step = 0;
-    int delay = 0;
-
-    if (!speed || speed > 60) {
-        speed = 60; /* Degrees/second assumed max speed. */
+    double MAX_STEP = 3;
+    double speed = std::abs(panorama->speed);
+    if (speed == 0 || speed > 1) {
+        speed = 1; /* 1 rad/second assumed max speed. */
     }
 
-    double panorama_duration = full_angle / speed;
+    float cur_angle = 0;
+    float target_angle = std::abs(panorama->angle);
+    float step = MAX_STEP;
+    int delay = 0;
+    // Set delay to slightly more than the calculated time.
+    double panorama_duration = std::abs(panorama->angle) / speed + 3;
 
     switch (panorama->trigger_state) {
     case Panorama_action::Trigger_state::ON:
-        step = min_step;
-        delay = 0;
         break;
     case Panorama_action::Trigger_state::SERIAL:
-        step = (std::abs(panorama->step) * 180.0) / M_PI;
         /* Per-sector delay. */
         delay = std::chrono::duration_cast<std::chrono::seconds>(panorama->delay).count();
+        // non zero delay. Use step from action.
+        step = std::abs(panorama->step);
+        // Add some time the delay to make the turn.
+        delay += step / speed + 2;
+        // do not add the long pause waypoint at the end.
+        panorama_duration = 0;
         break;
     }
 
-    if (!step) {
+    if (step == 0) {
         VEHICLE_LOG_WRN(vehicle, "Zero step angle, ignoring panorama.");
         return;
     }
 
-    double completed_angle = 0;
-    while (completed_angle + 0.1 < full_angle) {
-        double split_angle = completed_angle;
-        /* Add step desired by user. */
-        completed_angle += step;
-        /* Don't exceed the maximum angle, even if it does not evenly divides
-         * to desired step intervals.
-         */
-        if (completed_angle > full_angle) {
-            completed_angle = full_angle;
+    Add_mission_item(Build_heading_mission_item(current_heading));
+    /* Create additional waypoint at the current position with wait to
+     * stabilize before doing panorama. */
+    auto waiter = Build_wp_mission_item(last_move_action);
+    (*waiter)->param1 = 2; /* seconds. */
+    Add_mission_item(waiter);
+
+    // Set off the trigger
+    Add_camera_trigger_item();
+
+    while (cur_angle < target_angle) {
+        if (cur_angle + step > target_angle) {
+            step = target_angle - cur_angle;
         }
-        /* If desired step is more that 180 degrees, it should be split in
-         * min_step intervals, otherwise Ardupilot makes the shorter turn.
-         */
-        while (split_angle + 0.1 < completed_angle) {
-            double diff = split_angle;
-            split_angle += min_step;
-            if (split_angle > completed_angle) {
-                split_angle = completed_angle;
+
+        float cur_step_angle = 0;
+        while (cur_step_angle < step) {
+            if (step > MAX_STEP) {
+                cur_step_angle += MAX_STEP;
+            } else {
+                cur_step_angle += step;
             }
-            diff = split_angle - diff;
-            /* Turn is relative to current position. */
-            mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-            (*mi)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_YAW;
-            (*mi)->param1 = diff;
-            double val = diff / speed;
-            if (val < 1) {
-                val = 1; /* Fastest possible speed. */
+            if (cur_step_angle > step) {
+                cur_step_angle = step;
             }
-            (*mi)->param2 = val;
-            (*mi)->param3 = panorama->angle > 0 ? 1 /* clockwise. */ : 0 /* ccw */;
-            (*mi)->param4 = 1; /* relative angle. */
-            Add_mission_item(mi);
+            float temp_heading = cur_angle + cur_step_angle;
+            if (panorama->angle < 0) {
+                temp_heading = -temp_heading;
+            }
+            Add_mission_item(Build_heading_mission_item(
+                    Normalize_angle_0_2pi(current_heading + temp_heading),
+                    speed));
         }
         if (delay) {
-            /* Add delay after each segment. */
-            auto wait_segment = mavlink::Pld_mission_item::Create();
-            (*wait_segment)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_DELAY;
-            (*wait_segment)->param1 = delay;
-            Add_mission_item(wait_segment);
+            waiter = Build_wp_mission_item(last_move_action);
+            (*waiter)->param1 = delay;
+            Add_mission_item(waiter);
+
+            // Set off trigger
+            Add_camera_trigger_item();
         }
+        cur_angle += cur_step_angle;
+    }
+    if (panorama->angle > 0) {
+        current_heading = Normalize_angle_0_2pi(current_heading + target_angle);
+    } else {
+        current_heading = Normalize_angle_0_2pi(current_heading - target_angle);
     }
 
-/* Needed only if jump is used. */
-#if 0
-    /* Delay for 3 seconds to stabilize after panorama is done. */
-    auto wait_after = mavlink::Pld_mission_item::Create();
-    (*wait_after)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_DELAY;
-    (*wait_after)->param1 = 3;
-    Add_mission_item(wait_after);
-#endif
-
-/* Ardupilot jump command is broken (bug). It works only once, so don't use it. */
-#if 0
-    /* Jump to next waypoint and interrupt "pseudo indefinite wait" of
-     * 255 seconds.
-     */
-    mavlink::Pld_mission_item::Ptr jump = mavlink::Pld_mission_item::Create();
-    (*jump)->command = mavlink::MAV_CMD::MAV_CMD_DO_JUMP;
-    (*jump)->param2 = 1; /* Repeat once. */
-    /* Skip next long wait waypoint and jump to 'jump_to'. */
-    (*jump)->param1 = prepared_actions.size() + 2;
-    Add_mission_item(jump);
-#endif
 
     /* Create a waypoint with hold time slightly more than estimated
-     * panorama duration.
+     * panorama duration. Used only with Trigger_state::ON.
      */
-    auto long_wait = Build_wp_mission_item(last_move_action);
-    if (panorama_duration + 5 > 255) {
-        VEHICLE_LOG_WRN(vehicle, "Estimated panorama duration is truncated to 255 seconds.");
-        (*long_wait)->param1 = 255; /* Max possible wait for Ardupilot. */
-    } else {
-        (*long_wait)->param1 = panorama_duration + 5;
+    if (panorama_duration) {
+        VEHICLE_LOG_WRN(vehicle, "Estimated panorama duration is %f seconds.", panorama_duration);
+        auto long_wait = Build_wp_mission_item(last_move_action);
+        if (panorama_duration > 255) {
+            VEHICLE_LOG_WRN(vehicle, "Estimated panorama duration is truncated to 255 seconds.");
+            (*long_wait)->param1 = 255; /* Max possible wait for Ardupilot. */
+        } else {
+            (*long_wait)->param1 = panorama_duration;
+        }
+        Add_mission_item(long_wait);
+        LOG("long_wait WP %f", panorama_duration);
     }
-    Add_mission_item(long_wait);
-
-/* Not needed without jump. */
-#if 0
-    auto jump_to = Build_wp_mission_item(last_move_action);
-    /* Don't wait. Ardupilot does not support (most probably bug) jumping
-     * to waypoints with non-zero wait. */
-    (*jump_to)->param1 = 0;
-    Add_mission_item(jump_to);
-#endif
+    // panorama action terminates current POI.
+    restart_mission_poi = true;
 }
 
 void
@@ -1031,11 +1182,64 @@ Ardupilot_vehicle::Task_upload::Prepare_camera_control(Action::Ptr& action)
 }
 
 mavlink::Pld_mission_item::Ptr
+Ardupilot_vehicle::Task_upload::Build_heading_mission_item(
+        float heading,
+        float speed,
+        bool absolute_angle,
+        bool clockwise
+        )
+{
+    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_YAW;
+    (*mi)->param1 = (Normalize_angle_0_2pi(heading) * 180.0) / M_PI;
+    (*mi)->param2 = (speed * 180) / M_PI;
+    (*mi)->param3 = clockwise? 1: -1;       // Not implemented in AP.
+    (*mi)->param4 = absolute_angle? 0: 1;   /* absolute angle. */
+    return mi;
+}
+
+void
+Ardupilot_vehicle::Task_upload::Add_camera_trigger_item()
+{
+    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
+    (*mi)->param1 = ardu_vehicle.camera_servo_idx;
+    (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
+    (*mi)->param3 = 1;
+    (*mi)->param4 = ardu_vehicle.camera_servo_time;
+    Add_mission_item(mi);
+}
+
+mavlink::Pld_mission_item::Ptr
+Ardupilot_vehicle::Task_upload::Build_roi_mission_item(const Geodetic_tuple& coords)
+{
+    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_ROI;
+    if (coords.latitude == 0 && coords.longitude == 0 && coords.altitude == 0)
+    {
+        (*mi)->param1 = mavlink::MAV_ROI::MAV_ROI_NONE;
+    } else {
+        (*mi)->param1 = mavlink::MAV_ROI::MAV_ROI_LOCATION;
+    }
+    Fill_mavlink_mission_item_coords(*mi, coords, 0);
+    return mi;
+}
+
+mavlink::Pld_mission_item::Ptr
 Ardupilot_vehicle::Task_upload::Build_wp_mission_item(Action::Ptr& action)
 {
     Move_action::Ptr ma = action->Get_action<Action::Type::MOVE>();
     mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
+    switch (ma->turn_type) {
+    case Move_action::TURN_TYPE_SPLINE:
+        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_SPLINE_WAYPOINT;
+        break;
+    default:
+        VEHICLE_LOG_WRN(vehicle, "Invalid turn type: %d, defaulting to 'straight'.", ma->turn_type);
+    case Move_action::TURN_TYPE_STRAIGHT:
+        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
+        break;
+    }
     (*mi)->param1 = ma->wait_time * 10;
     /* Set acceptance radius to something reasonable. */
     if (ma->acceptance_radius < ACCEPTANCE_RADIUS_MIN) {
@@ -1047,7 +1251,6 @@ Ardupilot_vehicle::Task_upload::Build_wp_mission_item(Action::Ptr& action)
     }
     (*mi)->param3 = ma->loiter_orbit;
     Fill_mavlink_mission_item_coords(*mi, ma->position.Get_geodetic(), ma->heading);
-
     return mi;
 }
 
@@ -1191,6 +1394,15 @@ Ardupilot_vehicle::Update_capabilities()
 }
 
 void
+Ardupilot_vehicle::Configure()
+{
+    auto props = ugcs::vsm::Properties::Get_instance().get();
+    camera_servo_idx = props->Get_int("vehicle.ardupilot.camera_servo_idx");
+    camera_servo_pwm = props->Get_int("vehicle.ardupilot.camera_servo_pwm");
+    camera_servo_time = props->Get_float("vehicle.ardupilot.camera_servo_time");
+}
+
+void
 Ardupilot_vehicle::Update_capability_states()
 {
     Capability_states states;
@@ -1198,22 +1410,24 @@ Ardupilot_vehicle::Update_capability_states()
 
     switch (Get_type()) {
     case Type::COPTER:
-        states.Set(Capability_state::ARM_ENABLED);
-        states.Set(Capability_state::DISARM_ENABLED);
         if (status.state == Sys_status::State::ARMED) {
+            states.Set(Capability_state::DISARM_ENABLED);
             states.Set(Capability_state::AUTO_MODE_ENABLED);
             states.Set(Capability_state::MANUAL_MODE_ENABLED);
             states.Set(Capability_state::RETURN_HOME_ENABLED);
             states.Set(Capability_state::LAND_ENABLED);
+        } else {
+            states.Set(Capability_state::ARM_ENABLED);
         }
         break;
     case Type::PLANE:
-        states.Set(Capability_state::ARM_ENABLED);
-        states.Set(Capability_state::DISARM_ENABLED);
         if (status.state == Sys_status::State::ARMED) {
+            states.Set(Capability_state::DISARM_ENABLED);
             states.Set(Capability_state::AUTO_MODE_ENABLED);
             states.Set(Capability_state::MANUAL_MODE_ENABLED);
             states.Set(Capability_state::RETURN_HOME_ENABLED);
+        } else {
+            states.Set(Capability_state::ARM_ENABLED);
         }
         break;
     case Type::ROVER:

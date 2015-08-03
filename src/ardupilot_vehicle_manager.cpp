@@ -26,6 +26,7 @@ Ardupilot_vehicle_manager::Register_detectors()
             ugcs::vsm::Transport_detector::Make_connect_handler(
                     &Ardupilot_vehicle_manager::Handle_new_connection,
                     Shared_from_this(),
+                    false,
                     ugcs::vsm::Optional<std::string>(),
                     ugcs::vsm::Optional<std::string>()),
                     Shared_from_this());
@@ -38,6 +39,7 @@ Ardupilot_vehicle_manager::Register_detectors()
             ugcs::vsm::Transport_detector::Make_connect_handler(
                     &Ardupilot_vehicle_manager::Handle_new_connection,
                     Shared_from_this(),
+                    false,
                     ugcs::vsm::Optional<std::string>(),
                     ugcs::vsm::Optional<std::string>()),
                     Shared_from_this());
@@ -49,6 +51,7 @@ Ardupilot_vehicle_manager::Register_detectors()
             ugcs::vsm::Transport_detector::Make_connect_handler(
                     &Ardupilot_vehicle_manager::Handle_new_connection,
                     Shared_from_this(),
+                    false,
                     ugcs::vsm::Optional<std::string>(),
                     ugcs::vsm::Optional<std::string>()),
                     Shared_from_this());
