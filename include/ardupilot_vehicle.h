@@ -10,6 +10,8 @@
 
 #include <mavlink_vehicle.h>
 
+#define ARDUPILOT_VERSION(maj, min, patch) ((maj << 24) + (min << 16) + (patch << 8))
+
 /** Vehicle supporting Ardupilot specific flavor of Mavlink. */
 class Ardupilot_vehicle: public Mavlink_vehicle {
     DEFINE_COMMON_CLASS(Ardupilot_vehicle, Mavlink_vehicle)
@@ -29,13 +31,20 @@ public:
                     Vehicle::Capabilities(),
                     stream, mission_dump_path, std::forward<Args>(args)...),
             vehicle_command(*this),
-            task_upload(*this)
+            task_upload(*this),
+            read_parameters(*this)
     {
         /* Consider this as uptime start. */
         recent_connect = std::chrono::steady_clock::now();
         Configure();
         Update_capabilities();
     }
+
+    virtual void
+    On_enable();
+
+    virtual void
+    On_disable();
 
     /** Distinguishable type of Ardupilot vehicle. This is mainly driven by
      * Ardupilot firmware flavors each having some minor differences. */
@@ -113,6 +122,15 @@ public:
         void
         On_command_ack(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::COMMAND_ACK>::Ptr);
 
+        void
+        On_mission_ack(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::MISSION_ACK>::Ptr);
+
+        void
+        On_param_value(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr);
+
+        void
+        Send_next_command(bool previous_command_succeeded);
+
         /** Status text recieved. */
         void
         On_status_text(
@@ -151,11 +169,8 @@ public:
         /** Current command request. */
         ugcs::vsm::Vehicle_command_request::Handle vehicle_command_request;
 
-        /** Mavlink message to be sent to execute current command. */
-        ugcs::vsm::mavlink::Payload_base::Ptr cmd_message;
-
-        /** Command long message used by the command message, if applicable. */
-        ugcs::vsm::mavlink::Pld_command_long::Ptr cmd_long;
+        /** Mavlink messages to be sent to execute current command. */
+        std::list<ugcs::vsm::mavlink::Payload_base::Ptr> cmd_messages;
 
         /** Remaining attempts towards vehicle. */
         size_t remaining_attempts = 0;
@@ -306,6 +321,10 @@ public:
         void
         Task_atributes_uploaded(bool success);
 
+        /** Task attributes upload handler. */
+        void
+        Task_commands_sent(bool success);
+
         /** Mission upload handler. */
         void
         Mission_uploaded(bool success);
@@ -372,6 +391,17 @@ public:
              camera_series_by_time_active_in_wp = false;
 
     } task_upload;
+
+    Read_parameters read_parameters;
+
+    void
+    On_autopilot_version(ugcs::vsm::mavlink::Pld_autopilot_version ver);
+
+    void
+    On_mission_item(ugcs::vsm::mavlink::Pld_mission_item);
+
+    bool
+    On_home_location_timer();
 
 private:
 
@@ -469,6 +499,12 @@ private:
     void
     Configure();
 
+    void
+    Get_home_location();
+
+    bool
+    Is_home_position_valid();
+
     /**
      * Minimal waypoint acceptance radius to use.
      */
@@ -490,6 +526,22 @@ private:
      * Pre 3.2 needs POI for each WP
      * 3.2+ will keep pointing to current poi POI until POI(0,0,0) received.*/
     bool auto_generate_mission_poi = true;
+
+    Copter_flight_mode current_copter_flight_mode = Copter_flight_mode::LOITER;
+
+    /** Ardupilot version 3.3.1+ does not have FS_GPS_ENABLE parameter
+     * It uses FS_EKF_ACTION for that instead.
+     */
+    bool use_ekf_action_as_gps_failsafe = false;
+
+    /** Ardupilot version 3.3.1+ requires Home position
+     * to be sent as MAV_CMD instead of mission item. */
+    bool send_home_position_as_mav_cmd = false;
+
+    /** Poll for home location until it is nonzero. */
+    ugcs::vsm::Timer_processor::Timer::Ptr home_location_timer;
+
+    ugcs::vsm::Geodetic_tuple home_location {0,0,0};
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */

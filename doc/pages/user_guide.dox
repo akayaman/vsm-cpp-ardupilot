@@ -1,6 +1,6 @@
 /**
 
-@page vsm_user_guide Ardupilot VSM User Guide
+@page vsm_user_guide Connecting Ardupilot autopilot to UgCS
 
 @image latex ugcs-logo.png "" width=3cm
 @image latex main-vsm-logo.png "" width=3cm
@@ -34,24 +34,28 @@ installed and serial port is successfully created. Please refer to your
 communication equipment manufacturer documentation about driver installation
 instructions.
 
-4. Open _Vehicles_ window in UgCS Client and wait until new vehicle appears there
-automatically. Both Uplink and Downlink connections should be available. Press
-_Gain control_ and _Edit_ to select corresponding vehicle profile and change the default
-vehicle name to be convenient for you:
+4. As soon as uplink and downlink connection is established, the vehicle should
+appear in the active vehicles list in main (map) view. Open _Vehicles_ window
+from main menu and choose the corresponding vehicle for editing by clicking on
+the menu item and selecting _Edit_ button. Now you can select the vehicle
+profile and change the default vehicle name to be convenient for you:
 @image html new-ardu-vehicle.png "New Ardupilot vehicle"
 @image latex new-ardu-vehicle.png "New Ardupilot vehicle" width=15cm
 Vehicle profile needs to be assigned to allow mission planning with this vehicle.
-Image needs to be assigned to see vehicle location on the map.
+Vehicle avatar should be assigned in vehicle profile to properly see the vehicle
+location on map.
 
 5. Repeat steps above for each your Ardupilot vehicle.
 
 Supported vehicle types:
-- Copters.
+- Copters
+- Planes
 
 Supported Ardupilot firmware versions:
 - 3.0
 - 3.1.x
-- 3.2.x (recommended)
+- 3.2.x
+- 3.3.x
 
 Supported hardware platforms:
 - APM
@@ -61,10 +65,12 @@ _Note: Pixhawk with PX4 autopilot is not supported._
 
 @section mission_execution_specifics Mission execution specifics
 
+@note  If one wants to use automatic take-off, it is strongly recommended to place the first waypoint above the actual location of the vehicle. Otherwise the vehicle will reach for the first waypoint in a straight line thus possibly causing danger.
+
 __Mission action support:__
 Flight plan element / action | Support | Notes
 -----------------------------|---------|---------
-Change speed    |  Partial | Changing of flight speed during the mission is currently broken for Ardupilot due to firmware bugs.
+Change speed    |  Partial | Changing of flight speed during the mission may work only on latest 3.3.x firmware.
 Panorama        |  Partial | Only clock-wise movement is supported due to Ardupilot firmware bug. UgCS provides correct angle values according to Mavlink specification.
 Set camera mode |  Partial | Only photo mode is supported. |
 Set camera by time | Partial | "First shot delay" parameter is not supported. |
@@ -82,12 +88,36 @@ page "Optional hardware/Camera gimbal/Shutter" section. Select the channel your
 shutter is connected to and set other parameters depending on your shutter
 control hardware.
 
-__Home Location__
+@section home_location Home Location
 
-@warning Home location set via mission is ignored by Ardupilot.
+Home location support differs depending on ArduPilot firmware.
+
+__ArduCopter firmware version up to 3.2.1__
+
+@warning Home location set via mission is ignored by Ardupilot firmware version 3.2.1.
 
 Ardupilot will always override home location with current position at the time of arming.<br>
-When "RETURN_HOME" command is issued from UgCS Client or RC transmitter, vehicle will return to launch location regardless of home location set in mission.
+When "RETURN_HOME" command is issued from UgCS Client or RC transmitter, vehicle will return to the location it was armed at regardless of home location set in mission.
+
+__ArduCopter firmware version 3.3.1 and up__
+
+Mission upload automatically sets Home location. There are two restrictions on Home location:
+
+- Home location can be set only while enough GPS satellites are visible.
+
+- Home location should be close to current location (within 50km)
+
+Mission will fail to upload if any of the above conditions do not hold.  
+
+
+@subsection home_location_land Landing at Home Location
+
+Vehicle behavior after returning at Home Location depends on on the configuration parameter RTL_ATL_FINAL:
+
+- RTL_ATL_FINAL == 0: Vehicle will land automatically
+- RTL_ATL_FINAL > 0: Vehicle will descend to given altitude (in centimeters) and hover there waiting for user control.
+
+@note RTL_ATL_FINAL parameter can be set using MissionPlanner software.
 
 
 @section command_execution_specifics Command execution specifics
@@ -98,10 +128,14 @@ ARM            |  Yes     | Arms vehicle. |
 DISARM         |  Yes     | Disarms vehicle. |
 AUTOMODE       |  Yes     | Sets _Auto_ flight mode. |
 MANUALMODE     |  Yes     | Sets _Loiter_ flight mode. |
-RETURNHOME     |  Yes     | Vehicle will return to launch location regardless of home location set in mission. |
+CLICK & GO     |  Yes     | Sets _Click & Go_ (single waypoint) mode. |
+HOLD           |  Yes     | Pause mission execution. The drone will loiter at its current position. |
+CONTINUE       |  Yes     | Continue mission execution if previously paused by HOLD. |
+RETURN HOME    |  Yes     | Vehicle will return to home location. See also @ref home_location. |
 TAKEOFF        |  No      | |
 LAND           |  Yes     | |
 EMERGENCYLAND  |  No      | |
+CAMERA_TRIGGER |  No      | |
 
 @section commands_shading Command shading
 UGCS Client can show command buttons in different shades. You can always press all buttons disregarding of shade. Highlighted buttons suggest recommended commands, depending on vehicle current status.
@@ -109,12 +143,19 @@ UGCS Client can show command buttons in different shades. You can always press a
 __Command shading:__
 State		| Button highlighted | Button shaded |
 ------------|--------------------|---------------
-Armed		| DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME | ARM |
-Disarmed	| ARM | DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME |
+Armed		| DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME, CLICK-GO, HOLD, CONTINUE | ARM |
+Disarmed	| ARM | DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME, CLICK-GO, HOLD, CONTINUE |
 
 @section telemetry_info Telemetry information specifics
 
-Nothing specific.
+@subsection air_speed Air speed
+If there is no air speed sensor onboard, air speed will be shown as "Not available". If there is an air speed sensor onboard, the air speed value will be shown.
+
+@subsection rc_link_quality RC link quality
+Ardupilot reports RC link loss correctly only when throttle failsafe is activated.
+- Throttle failsafe must be configured. (Set parameter FS_THR_ENABLE to nonzero and configure throttle channel to go below FS_THR_VALUE on RC link loss)
+- Ardupilot reports RC link correctly only while armed. If RC signal is lost while vehicle is disarmed it will still appear as 100%. (This is Ardupilot firmware limitation)
+- RC link quality is available only for multicopter and heli firmware (ArduCopter). Fixed wing (ArduPlane) and rover (ArduRover) does not report RC link status.
 
 @section fail-safe Fail-safe actions
 
@@ -143,6 +184,7 @@ Continue		| Aircaft continues mission|
 @section turn_type_specifics Waypoint turn types
 
 There are 2 different routing planning modes for Ardupilot autopilots: Straight waypoint and Spline waypoint. You can choose turn type for each Waypoint, Circle, Perimeter. The default turn mode in the system is Straight type.
+
 @image html turn-mode.png "Turn type"
 @image latex turn-mode.png "Turn type" width=10cm
 
@@ -151,7 +193,21 @@ Turn type          | Support  | Notes
 Straight           |  Yes     | The vehicle will fly a straight line to the location specified as a lat, lon and altitude. |
 Spline             |  Yes     | The vehicle will fly to the location specified as a lat, lon and altitude, but when executed the vehicle will fly smooth paths (both vertically and horizontally) instead of straight lines. |
 
+@note When using Spline turn type make sure the line segment after the waypoint is long enough otherwise autopilot can fly unexpectedly missing some waypoints.
+What is "long enough"? The desired segment length varies with speed.
+Our tests show that with ground speed 5m/s route segment must be at least 20m long. If speed is set to 10m/s then route segment after the waypoint should be at least 50 meters.
+
 You can find more information about turning mode and supporting autopilots on the site https://github.com/diydrones/apm_planner/issues/274, http://copter.ardupilot.com/wiki/mission-command-list/#spline_waypoint.
+
+@section zigbee_connection Connection using ZigBee interface
+
+There is a possibility to connect UgCS to Ardupilot vehicle using ZigBee
+interface. Connection is performed with two or more Digi XBee ZigBee modules (one
+on ground side, others on vehicles side) and dedicated UgCS software component
+called XBee Connector. Please refer to XBee Connector user guide for details.
+
+In order to use such kind of connection you are to disable
+@ref serial_port_parameters and enable @ref proxy_parameters.
 
 
 @section config_file_parameters_section Configuration file
