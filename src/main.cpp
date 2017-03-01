@@ -8,7 +8,6 @@
 #include <ugcs/vsm/callback.h>
 #include <ugcs/vsm/run_as_service.h>
 #include <ardupilot_vehicle_manager.h>
-#include <adsb_manager.h>
 
 #define ADSB_DISABLED
 
@@ -28,7 +27,6 @@ void Sigint_handler(int signum __UNUSED)
 
 
 Ardupilot_vehicle_manager::Ptr manager;
-Adsb_manager::Ptr adsb_manager;
 
 int
 start_main(int argc, char *argv[])

@@ -61,8 +61,6 @@ Supported hardware platforms:
 - APM
 - Pixhawk
 
-_Note: Pixhawk with PX4 autopilot is not supported._
-
 @section mission_execution_specifics Mission execution specifics
 
 @note  If one wants to use automatic take-off, it is strongly recommended to place the first waypoint above the actual location of the vehicle. Otherwise the vehicle will reach for the first waypoint in a straight line thus possibly causing danger.
@@ -75,6 +73,9 @@ Panorama        |  Partial | Only clock-wise movement is supported due to Ardupi
 Set camera mode |  Partial | Only photo mode is supported. |
 Set camera by time | Partial | "First shot delay" parameter is not supported. |
 Set camera by distance | Partial | Only "Distance" parameter is supported. |
+Set camera attitude | No | |
+Set POI | Yes | |
+Change yaw | Yes | |
 
 __Camera control__
 
@@ -87,6 +88,17 @@ For example, in MissionPlanner the camera set up can be done in "Initial setup"
 page "Optional hardware/Camera gimbal/Shutter" section. Select the channel your
 shutter is connected to and set other parameters depending on your shutter
 control hardware.
+
+@section altitude Altitude
+
+Ardupilot reports two altitude types - AMSL (Above Mean Sea Level) and AHL (Above Home Location). 
+UgCS is using only the reported AMSL altitude. In previous versions altitude AHL from Adrupilot was reported as RAW altitude.
+It was decided not to show altitude AHL as RAW because it would be inconsistent with other supported autopilots.
+Altitude AHL will be added in future versions of UgCS.
+
+Current altitude AGL (Above Ground Level) is calculated as:
+
+_Vehicle altitude AGL = Reported vehicle altitude AMSL - Terrain elevation AMSL at vehicle location_ 
 
 @section home_location Home Location
 
@@ -101,23 +113,25 @@ When "RETURN_HOME" command is issued from UgCS Client or RC transmitter, vehicle
 
 __ArduCopter firmware version 3.3.1 and up__
 
-Mission upload automatically sets Home location. There are two restrictions on Home location:
+Mission upload automatically sets Home location. There are several restrictions on Home location:
 
 - Home location can be set only while enough GPS satellites are visible.
 
 - Home location should be close to current location (within 50km)
 
-Mission will fail to upload if any of the above conditions do not hold.  
+Mission will fail to upload if any of the above conditions do not hold.
+
+@note Home location altitude is always 0m AGL (Above Ground Level). I.e. Vehicle must be launched from the ground level. This is a limitation of UgCS software and will be removed in future versions. 
 
 
 @subsection home_location_land Landing at Home Location
 
-Vehicle behavior after returning at Home Location depends on on the configuration parameter RTL_ATL_FINAL:
+Vehicle behavior after returning at Home Location depends on on the configuration parameter RTL_ALT_FINAL:
 
-- RTL_ATL_FINAL == 0: Vehicle will land automatically
-- RTL_ATL_FINAL > 0: Vehicle will descend to given altitude (in centimeters) and hover there waiting for user control.
+- RTL_ALT_FINAL == 0: Vehicle will land automatically
+- RTL_ALT_FINAL > 0: Vehicle will descend to given altitude (in centimeters) and hover there waiting for user control.
 
-@note RTL_ATL_FINAL parameter can be set using MissionPlanner software.
+@note RTL_ALT_FINAL parameter can be set using MissionPlanner software.
 
 
 @section command_execution_specifics Command execution specifics
@@ -126,25 +140,42 @@ Command        | Support  | Notes
 ---------------|----------|---------
 ARM            |  Yes     | Arms vehicle. |
 DISARM         |  Yes     | Disarms vehicle. |
-AUTOMODE       |  Yes     | Sets _Auto_ flight mode. |
-MANUALMODE     |  Yes     | Sets _Loiter_ flight mode. |
+AUTOMODE       |  Yes     | Start mission from first waypoint. Sets vehicle into _Auto_ flight mode. |
+MANUALMODE     |  Yes     | Sets _Manual_ mode. It's @b LOITER for multicopter frames and @b STABILIZE for fixed wing. |
 CLICK & GO     |  Yes     | Sets _Click & Go_ (single waypoint) mode. |
+JOYSTICK       |  Yes     | Sets _Joystick mode_. See also @ref joystick below. |
 HOLD           |  Yes     | Pause mission execution. The drone will loiter at its current position. |
-CONTINUE       |  Yes     | Continue mission execution if previously paused by HOLD. |
+CONTINUE       |  Yes     | Continue with mission execution from next waypoint. Works from _Manual_, Joystick_ and _Click&Go_ modes.|
 RETURN HOME    |  Yes     | Vehicle will return to home location. See also @ref home_location. |
 TAKEOFF        |  No      | |
 LAND           |  Yes     | |
 EMERGENCYLAND  |  No      | |
 CAMERA_TRIGGER |  No      | |
 
+@section joystick Joystick support
+
+Ardupilot can be put into Joystick mode which allows user to manually control the vehicle in similar way to RC transmitter.
+Please note that Joystick mode is inherently more fragile than direct manual control via RC transmitter because it involves many different data links and components:
+
+Joystick device --> UgCS client --> server --> VSM --> Ground Radio --> Air Radio --> Autopilot
+
+If any of the above links fail, the joystick control is broken and vehicle automatically goes into manual mode. (Loiter for copters and Stabilize for planes)
+This is why user should be very careful when working with Joystick control mode.
+It is recommended to have RC transmitter as backup controller.
+
+@note Joystick control mode is disabled by default for fixed wing frames.
+To enable Joystick mode for planes please refer to section @ref joystick_control_params.
+
 @section commands_shading Command shading
+
 UGCS Client can show command buttons in different shades. You can always press all buttons disregarding of shade. Highlighted buttons suggest recommended commands, depending on vehicle current status.
 
-__Command shading:__
+__Command shading__
+
 State		| Button highlighted | Button shaded |
 ------------|--------------------|---------------
-Armed		| DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME, CLICK-GO, HOLD, CONTINUE | ARM |
-Disarmed	| ARM | DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME, CLICK-GO, HOLD, CONTINUE |
+Armed		| DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME, CLICK-GO, JOYSTICK, HOLD, CONTINUE | ARM |
+Disarmed	| ARM | DISARM, AUTOMODE, MANUALMODE, LAND, RETURNHOME, CLICK-GO, JOYSTICK, HOLD, CONTINUE |
 
 @section telemetry_info Telemetry information specifics
 
@@ -181,9 +212,14 @@ Land			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and
 Return Home		| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
 Continue		| Aircaft continues mission|
 
+__Datalink loss:__
+
+Failsafe actions on datalink loss not supported.
+
 @section turn_type_specifics Waypoint turn types
 
-There are 2 different routing planning modes for Ardupilot autopilots: Straight waypoint and Spline waypoint. You can choose turn type for each Waypoint, Circle, Perimeter. The default turn mode in the system is Straight type.
+UgCS supports two turn types for VTOL vehicles (Multicopter and Heli): Straight waypoint and Spline waypoint. 
+You can choose turn type for each Waypoint, Circle, Perimeter. The default turn mode in the system is Straight type.
 
 @image html turn-mode.png "Turn type"
 @image latex turn-mode.png "Turn type" width=10cm
@@ -193,11 +229,17 @@ Turn type          | Support  | Notes
 Straight           |  Yes     | The vehicle will fly a straight line to the location specified as a lat, lon and altitude. |
 Spline             |  Yes     | The vehicle will fly to the location specified as a lat, lon and altitude, but when executed the vehicle will fly smooth paths (both vertically and horizontally) instead of straight lines. |
 
-@note When using Spline turn type make sure the line segment after the waypoint is long enough otherwise autopilot can fly unexpectedly missing some waypoints.
+@note  
+ - When using Spline turn type make sure the line segment after the waypoint is long enough otherwise autopilot can fly unexpectedly missing some waypoints.
 What is "long enough"? The desired segment length varies with speed.
 Our tests show that with ground speed 5m/s route segment must be at least 20m long. If speed is set to 10m/s then route segment after the waypoint should be at least 50 meters.
 
-You can find more information about turning mode and supporting autopilots on the site https://github.com/diydrones/apm_planner/issues/274, http://copter.ardupilot.com/wiki/mission-command-list/#spline_waypoint.
+@note 
+ - Different turn types for fixed wing vehicles are not supported.
+
+You can find more information about turning mode and supporting autopilots on the sites:
+ - https://github.com/diydrones/apm_planner/issues/274
+ - http://copter.ardupilot.com/wiki/mission-command-list/#spline_waypoint
 
 @section zigbee_connection Connection using ZigBee interface
 
@@ -236,19 +278,13 @@ All VSMs share a common set of configuration file parameters described in
 
     vehicle.ardupilot
 
-@subsection serial_port_params_vsmspec Serial port configuration
+@subsection connection_spec Communication channel configuration
 
-Mandatory. At least one serial port should be configured, otherwise VSM will not
-try to connect to the vehicle.
+There must be at least one communication channel defined, otherwise VSM will not
+try to connect to the vehicle. See @ref vsm_comm_setup for details
 
-- @b Name: vehicle.ardupilot.serial_port
-- @b Description: Serial port configuration, for more details see
-@ref serial_port_parameters.
-Default Ardupilot serial port communication speed is 57600 bps.
-- @b Example:
-
-         vehicle.ardupilot.serial_port.1.name = com1
-         vehicle.ardupilot.serial_port.1.baud = 57600
+Default installation is configured to detect autopilot automatically on
+any available serial port at 57600 or 115Kbps.
 
 @subsection model_override_params Model name and serial number override
 
@@ -294,5 +330,29 @@ in "servo" mode (not "relay") for camera triggering.
 - @b Example:
 
          vehicle.ardupilot.camera_servo_time = 1.0
+
+@subsection joystick_control_params Joystick control parameters
+
+Optional. By default joystick control mode is disabled for fixed wing frames due to safety reasons.
+Add vehicle.ardupilot.enable_joystick_control_for_fixed_wing to enable joystick control for fixed wing vehicles, too.
+
+- @b Name: vehicle.ardupilot.enable_joystick_control_for_fixed_wing
+- @b Description: Enable joystick control for fixed wing vehicles.
+- @b Default: no
+- @b Example:
+
+         vehicle.ardupilot.enable_joystick_control_for_fixed_wing = yes
+
+@subsection report_relative_altitude Report relative altitude
+
+Optional. By default Ardupilot VSM will report relative altitude as RAW altitude because it is more precise than GPS altitude.
+For some installations GPS altitude from vehicle is more appropriate, e.g. when RTK GPS is used.
+
+- @b Name: vehicle.ardupilot.report_relative_altitude
+- @b Description: Enable/Disable reporting of relative altitude in telemetry.
+- @b Default: yes
+- @b Example:
+
+         vehicle.ardupilot.report_relative_altitude = no
 
 */

@@ -34,6 +34,7 @@ public:
             task_upload(*this),
             read_parameters(*this)
     {
+        autopilot_type = "ardupilot";
         /* Consider this as uptime start. */
         recent_connect = std::chrono::steady_clock::now();
         Configure();
@@ -62,12 +63,6 @@ public:
     /** UCS has sent a task for a vehicle. */
     virtual void
     Handle_vehicle_request(ugcs::vsm::Vehicle_task_request::Handle request) override;
-
-    /**
-     * UCS requesting to clear up all missions on a vehicle.
-     */
-    virtual void
-    Handle_vehicle_request(ugcs::vsm::Vehicle_clear_all_missions_request::Handle request) override;
 
     /**
      * UCS requesting command execution on a vehicle.
@@ -129,7 +124,7 @@ public:
         On_param_value(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr);
 
         void
-        Send_next_command(bool previous_command_succeeded);
+        Send_next_command();
 
         /** Status text recieved. */
         void
@@ -165,6 +160,11 @@ public:
          * of the current vehicle type. */
         uint32_t
         Get_custom_manual_mode();
+
+        /** Get the value of custom mode corresponding to guided mode
+         * of the current vehicle type. */
+        uint32_t
+        Get_custom_guided_mode();
 
         /** Current command request. */
         ugcs::vsm::Vehicle_command_request::Handle vehicle_command_request;
@@ -267,7 +267,7 @@ public:
 
         /** Previous activity is completed, enable class and start task upload. */
         void
-        Enable(bool success, ugcs::vsm::Vehicle_task_request::Handle);
+        Enable(ugcs::vsm::Vehicle_task_request::Handle);
 
         /** Disable this class and cancel any existing request. */
         virtual void
@@ -319,15 +319,15 @@ public:
 
         /** Task attributes upload handler. */
         void
-        Task_atributes_uploaded(bool success);
+        Task_atributes_uploaded(bool success, std::string);
 
         /** Task attributes upload handler. */
         void
-        Task_commands_sent(bool success);
+        Task_commands_sent(bool success, std::string = "");
 
         /** Mission upload handler. */
         void
-        Mission_uploaded(bool success);
+        Mission_uploaded(bool success, std::string);
 
         /**
          * Fill coordinates into Mavlink message based on ugcs::vsm::Geodetic_tuple and
@@ -505,6 +505,24 @@ private:
     bool
     Is_home_position_valid();
 
+    void
+    Start_rc_override();
+
+    void
+    Send_rc_override();
+
+    bool
+    Send_rc_override_timer();
+
+    bool
+    Is_rc_override_active();
+
+    void
+    Stop_rc_override();
+
+    void
+    Set_rc_override(int p, int r, int t, int y);
+
     /**
      * Minimal waypoint acceptance radius to use.
      */
@@ -519,6 +537,10 @@ private:
     int camera_servo_pwm;
     /** Time to hold camera servo at the specified PWM when triggering. */
     float camera_servo_time;
+
+    /** By default joystick mode is disabled for planes.
+     * Turn on via an entry in conf file. */
+    bool enable_joystick_control_for_fixed_wing = false;
 
     /** If vehicle does not support ROI for multiple WPts then VSM must
      * generate POI commands for each WP until POI(none) received.
@@ -542,6 +564,37 @@ private:
     ugcs::vsm::Timer_processor::Timer::Ptr home_location_timer;
 
     ugcs::vsm::Geodetic_tuple home_location {0,0,0};
+
+    /** Joystick mode support */
+
+    // Timer instance for sending rc_override messages.
+    ugcs::vsm::Timer_processor::Timer::Ptr rc_override_timer = nullptr;
+
+    // RC Override message which holds the latest joystick values.
+    // Existence of this messages means that vehicle is in joystick mode.
+    ugcs::vsm::mavlink::Pld_rc_channels_override::Ptr rc_override = nullptr;
+
+    // Last time we sent the rc_overrride message. Used to limit rate at which
+    // the joystick commands are sent to vehicle.
+    std::chrono::time_point<std::chrono::steady_clock> rc_override_last_sent;
+
+    // Last time we received joystick message from ucs. Used to fail over to
+    // manual mode automatically if no messages received for RC_OVERRIDE_TIMEOUT.
+    std::chrono::time_point<std::chrono::steady_clock> direct_vehicle_control_last_received;
+
+    // Timeout when to revert back to manual mode if no joystick messages
+    // received from ucs.
+    constexpr static std::chrono::milliseconds RC_OVERRIDE_TIMEOUT {3000};
+
+    // Counter which governs the end of Joystick mode. To ensure ardupilot
+    // exits rc_override we need to spam 0,0,0,0 messages.
+    size_t rc_override_end_counter = 0;
+
+    // How frequently to send the rc_overrride messages to vehicle.
+    constexpr static std::chrono::milliseconds RC_OVERRIDE_PERIOD {200};
+
+    // How many 0,0,0,0 rc_override messages to send to exit joystick mode.
+    constexpr static size_t RC_OVERRIDE_END_COUNT = 15;
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */

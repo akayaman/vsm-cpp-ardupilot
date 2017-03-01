@@ -26,6 +26,7 @@ Ardupilot_vehicle_manager::Register_detectors()
             ugcs::vsm::Transport_detector::Make_connect_handler(
                     &Ardupilot_vehicle_manager::Handle_new_connection,
                     Shared_from_this(),
+                    ugcs::vsm::mavlink::MAV_AUTOPILOT_ARDUPILOTMEGA,
                     false,
                     ugcs::vsm::Optional<std::string>(),
                     ugcs::vsm::Optional<std::string>()),
@@ -39,6 +40,7 @@ Ardupilot_vehicle_manager::Register_detectors()
             ugcs::vsm::Transport_detector::Make_connect_handler(
                     &Ardupilot_vehicle_manager::Handle_new_connection,
                     Shared_from_this(),
+                    ugcs::vsm::mavlink::MAV_AUTOPILOT_ARDUPILOTMEGA,
                     false,
                     ugcs::vsm::Optional<std::string>(),
                     ugcs::vsm::Optional<std::string>()),
@@ -51,6 +53,7 @@ Ardupilot_vehicle_manager::Register_detectors()
             ugcs::vsm::Transport_detector::Make_connect_handler(
                     &Ardupilot_vehicle_manager::Handle_new_connection,
                     Shared_from_this(),
+                    ugcs::vsm::mavlink::MAV_AUTOPILOT_ARDUPILOTMEGA,
                     false,
                     ugcs::vsm::Optional<std::string>(),
                     ugcs::vsm::Optional<std::string>()),
@@ -105,5 +108,6 @@ Ardupilot_vehicle_manager::Create_mavlink_vehicle(
             stream,
             mission_dump_path,
             serial_number,
-            model_name);
+            model_name,
+            !id_overridden);
 }
