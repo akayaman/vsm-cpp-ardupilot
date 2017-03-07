@@ -628,7 +628,7 @@ Ardupilot_vehicle::Vehicle_command_act::On_command_ack(
                 Send_next_command();
             } else {
                 auto p = message->payload->result.Get();
-                vehicle_command_request.Fail("Result: %d (%s)", p, Mav_result_to_string(p).c_str());
+                vehicle_command_request.Fail("Mavlink command failed with result %d", p);
                 Disable();
             }
         } else {
@@ -651,11 +651,7 @@ Ardupilot_vehicle::Vehicle_command_act::On_mission_ack(
         if (message->payload->type == mavlink::MAV_MISSION_RESULT::MAV_MISSION_ACCEPTED) {
             Send_next_command();
         } else {
-            auto p = message->payload->type.Get();
-            vehicle_command_request.Fail(
-                "Result: %d (%s)",
-                p,
-                Mav_mission_result_to_string(p).c_str());
+            vehicle_command_request.Fail("MISSION_ACK, result %d", message->payload->type.Get());
             Disable();
         }
     } else {
@@ -1124,41 +1120,24 @@ Ardupilot_vehicle::Task_upload::Prepare_task()
     Prepare_action(set_home_action);
 
     bool first_set_home_found = false;
-    bool takeoff_added = false;
 
     last_move_action = nullptr;
     for (auto& iter:request->actions) {
         switch (iter->Get_type()) {
-        case Action::Type::TAKEOFF:
-            takeoff_added = true;
-            break;
-        case Action::Type::MOVE:
-            if (!takeoff_added) {
-                // First WP found without prior takeoff action.
-                // Insert takeoff action on first WP.
-                // Required for ArduCopter 3.4+ otherwise it fails AUTO command.
-                auto to = iter->Get_action<Action::Type::MOVE>();
-                VEHICLE_LOG_WRN(vehicle, "Auto-adding TAKEOFF action before 1st WP");
-                mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-                (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_TAKEOFF;
-                (*mi)->param1 = 0; /* No data for pitch. */
-                Fill_mavlink_mission_item_coords(*mi, to->position.Get_geodetic(), to->heading);
-                Add_mission_item(mi);
-                takeoff_added = true;
-            }
-            break;
         case Action::Type::SET_HOME:
             if (!first_set_home_found) {
                 /* Skip first set_home, it has been already processed and put
                  * into waypoint index zero. */
                 first_set_home_found = true;
-                continue;
+            } else {
+                /* To be tested. */
+                Prepare_action(iter);
             }
             break;
         default:
+            Prepare_action(iter);
             break;
         }
-        Prepare_action(iter);
     }
 
     if (last_move_action) {
@@ -2174,20 +2153,14 @@ Ardupilot_vehicle::Update_capability_states()
 
     switch (Get_type()) {
     case Type::COPTER:
-    case Type::PLANE:
         if (status.control_mode != Sys_status::Control_mode::MANUAL) {
             states.Set(Capability_state::MANUAL_MODE_ENABLED);
         }
         if (status.state == Sys_status::State::ARMED) {
-            if (status.control_mode == Sys_status::Control_mode::AUTO) {
-                states.Set(Capability_state::PAUSE_MISSION_ENABLED);
-            } else {
+            if (status.control_mode != Sys_status::Control_mode::AUTO) {
                 states.Set(Capability_state::AUTO_MODE_ENABLED);
-                states.Set(Capability_state::RESUME_MISSION_ENABLED);
             }
-            if (status.control_mode == Sys_status::Control_mode::GUIDED) {
-                states.Set(Capability_state::PAUSE_MISSION_ENABLED);
-            } else {
+            if (status.control_mode != Sys_status::Control_mode::GUIDED) {
                 states.Set(Capability_state::GUIDED_MODE_ENABLED);
             }
             if (status.control_mode == Sys_status::Control_mode::JOYSTICK) {
@@ -2196,12 +2169,36 @@ Ardupilot_vehicle::Update_capability_states()
                 states.Set(Capability_state::JOYSTICK_MODE_ENABLED);
             }
 
-            if (Get_type() == Type::COPTER) {
-                // Land only for copter.
-                states.Set(Capability_state::LAND_ENABLED);
+            states.Set(Capability_state::DISARM_ENABLED);
+            states.Set(Capability_state::WAYPOINT_ENABLED);
+            states.Set(Capability_state::PAUSE_MISSION_ENABLED);
+            states.Set(Capability_state::RESUME_MISSION_ENABLED);
+            states.Set(Capability_state::RETURN_HOME_ENABLED);
+            states.Set(Capability_state::LAND_ENABLED);
+        } else {
+            states.Set(Capability_state::ARM_ENABLED);
+        }
+        break;
+    case Type::PLANE:
+        if (status.control_mode != Sys_status::Control_mode::MANUAL) {
+            states.Set(Capability_state::MANUAL_MODE_ENABLED);
+        }
+        if (status.state == Sys_status::State::ARMED) {
+            if (status.control_mode != Sys_status::Control_mode::AUTO) {
+                states.Set(Capability_state::AUTO_MODE_ENABLED);
+            }
+            if (status.control_mode != Sys_status::Control_mode::GUIDED) {
+                states.Set(Capability_state::GUIDED_MODE_ENABLED);
+            }
+            if (status.control_mode == Sys_status::Control_mode::JOYSTICK) {
+                states.Set(Capability_state::DIRECT_VEHICLE_CONTROL_ENABLED);
+            } else {
+                states.Set(Capability_state::JOYSTICK_MODE_ENABLED);
             }
             states.Set(Capability_state::DISARM_ENABLED);
             states.Set(Capability_state::WAYPOINT_ENABLED);
+            states.Set(Capability_state::PAUSE_MISSION_ENABLED);
+            states.Set(Capability_state::RESUME_MISSION_ENABLED);
             states.Set(Capability_state::RETURN_HOME_ENABLED);
         } else {
             states.Set(Capability_state::ARM_ENABLED);

@@ -61,6 +61,8 @@ Supported hardware platforms:
 - APM
 - Pixhawk
 
+_Note: Pixhawk with PX4 autopilot is not supported._
+
 @section mission_execution_specifics Mission execution specifics
 
 @note  If one wants to use automatic take-off, it is strongly recommended to place the first waypoint above the actual location of the vehicle. Otherwise the vehicle will reach for the first waypoint in a straight line thus possibly causing danger.
