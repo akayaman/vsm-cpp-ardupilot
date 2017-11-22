@@ -1,4 +1,4 @@
-// Copyright (c) 2014, Smart Projects Holdings Ltd
+// Copyright (c) 2017, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
@@ -31,8 +31,7 @@ public:
                     Vehicle::Capabilities(),
                     stream, mission_dump_path, std::forward<Args>(args)...),
             vehicle_command(*this),
-            task_upload(*this),
-            read_parameters(*this)
+            task_upload(*this)
     {
         autopilot_type = "ardupilot";
         /* Consider this as uptime start. */
@@ -70,6 +69,9 @@ public:
     virtual void
     Handle_vehicle_request(ugcs::vsm::Vehicle_command_request::Handle request) override;
 
+    virtual void
+    Handle_ucs_command(ugcs::vsm::Ucs_request::Ptr ucs_request);
+
     /** Get the Type of the vehicle. */
     Type
     Get_type() const;
@@ -97,21 +99,13 @@ public:
 
         using Ardupilot_activity::Ardupilot_activity;
 
-        /** Related constants. */
-        enum {
-            ATTEMPTS = 3,
-            /** In seconds. Fired if there were no any status messages since
-             * the most recent command. It is assumed that command was lost. */
-            RETRY_TIMEOUT_SHORT = 3,
-            /** In seconds. Activated after the first status text is received
-             * after the most recent command. Fired if there was no command ack
-             * since the most recent command. */
-            RETRY_TIMEOUT_LONG = 20,
-        };
-
         /** Try execute command a vehicle. */
         bool
         Try();
+
+        /** Try execute a verifying command for polyfence */
+        bool
+        Try_verify_polyfence();
 
         /** Command ack received. */
         void
@@ -124,6 +118,15 @@ public:
         On_param_value(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr);
 
         void
+        On_point_value(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::FENCE_POINT, ugcs::vsm::mavlink::apm::Extension>::Ptr);
+
+        void
+        On_mission_current(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::MISSION_CURRENT>::Ptr);
+
+        void
+        On_param_str_value(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE, ugcs::vsm::mavlink::sph::Extension>::Ptr);
+
+        void
         Send_next_command();
 
         /** Status text recieved. */
@@ -133,15 +136,22 @@ public:
 
         /** Enable class and start command execution. */
         void
-        Enable(ugcs::vsm::Vehicle_command_request::Handle vehicle_command_request);
+        Enable();
 
-        /** Disable this class and cancel any existing request. */
-        virtual void
-        On_disable() override;
+        /** Disable the activity. */
+        void
+        Disable(const std::string& status);
+
+        void
+        Disable_success();
 
         /** Schedule timer for retry operation. */
         void
         Schedule_timer();
+
+        /** Schedule timer for verifying operation. */
+        void
+        Schedule_verify_timer();
 
         /** Register status text handler. */
         void
@@ -169,6 +179,9 @@ public:
         /** Current command request. */
         ugcs::vsm::Vehicle_command_request::Handle vehicle_command_request;
 
+        /** new style command request. */
+        ugcs::vsm::Ucs_request::Ptr ucs_request = nullptr;
+
         /** Mavlink messages to be sent to execute current command. */
         std::list<ugcs::vsm::mavlink::Payload_base::Ptr> cmd_messages;
 
@@ -179,7 +192,17 @@ public:
         ugcs::vsm::Timer_processor::Timer::Ptr timer;
 
         /** Current timeout to use when scheduling timer. */
-        size_t current_timeout = 0;
+        std::chrono::milliseconds current_timeout;
+
+        /** check if point is inside polygon.
+         *  Algorithm was taken from ardupilot cause we have to check if the returning point
+         *  for geofence is outside polygon exactly as ardupilot does.
+         *  If returning point is outside polygon fence then fence will not work and there is
+         *  no way to know about it from ardupilot
+         */
+        bool
+        Is_Outside_Polygon(double check_point_latitude, double check_point_longitude,
+                           ugcs::vsm::proto::List_value lats, ugcs::vsm::proto::List_value lngs);
     } vehicle_command;
 
     /** Data related to task upload processing. */
@@ -244,6 +267,13 @@ public:
 
         void
         Prepare_camera_trigger(ugcs::vsm::Action::Ptr&);
+
+        void
+        Prepare_set_servo(ugcs::vsm::Action::Ptr&);
+
+        void
+        Prepare_repeat_servo(ugcs::vsm::Action::Ptr&);
+
         //@}
 
         /** Build waypoint mission item based on move action. */
@@ -323,11 +353,19 @@ public:
 
         /** Task attributes upload handler. */
         void
+        Upload_parameters(bool success, std::string);
+
+        /** Task attributes upload handler. */
+        void
         Task_commands_sent(bool success, std::string = "");
 
-        /** Mission upload handler. */
+        /** Mission uploaded. */
         void
         Mission_uploaded(bool success, std::string);
+
+        /** Mission downloaded. Calculate the mission_id. */
+        void
+        Mission_downloaded(bool success, std::string);
 
         /**
          * Fill coordinates into Mavlink message based on ugcs::vsm::Geodetic_tuple and
@@ -392,13 +430,38 @@ public:
 
     } task_upload;
 
-    Read_parameters read_parameters;
+
+    void
+    On_adsb_state(
+        ugcs::vsm::mavlink::Message<
+            ugcs::vsm::mavlink::sph::SPH_ADSB_TRANSPONDER_STATE,
+            ugcs::vsm::mavlink::sph::Extension>::Ptr message);
 
     void
     On_autopilot_version(ugcs::vsm::mavlink::Pld_autopilot_version ver);
 
     void
+    On_parameter(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr);
+
+    void
+    On_string_parameter(
+        ugcs::vsm::mavlink::Message<
+            ugcs::vsm::mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE,
+            ugcs::vsm::mavlink::sph::Extension>::Ptr message);
+
+    void
     On_mission_item(ugcs::vsm::mavlink::Pld_mission_item);
+
+    void
+    Report_home_location(double lat, double lon, float alt);
+
+    void
+    On_home_position(
+        ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::HOME_POSITION>::Ptr m);
+
+
+    void
+    On_mission_downloaded(bool, const std::string);
 
     bool
     On_home_location_timer();
@@ -475,17 +538,15 @@ private:
     Process_heartbeat(
             ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::HEARTBEAT>::Ptr) override;
 
-    /** Map copter custom mode from the heartbeat to system status control mode. */
-    Sys_status::Control_mode
-    Map_copter_flight_mode(Copter_flight_mode custom_mode);
+    /** Map custom flight mode from the heartbeat to our flight mode. */
+    void
+    Update_flight_mode(int);
 
-    /** Map plane custom mode from the heartbeat to system status control mode. */
-    Sys_status::Control_mode
-    Map_plane_flight_mode(Plane_flight_mode custom_mode);
+    const char*
+    Get_native_flight_mode_name(int);
 
-    /** Map rover custom mode from the heartbeat to system status control mode. */
     Sys_status::Control_mode
-    Map_rover_flight_mode(Rover_flight_mode custom_mode);
+    Map_control_mode(int);
 
     /** Updates current capabilities based on vehicle type. */
     void
@@ -501,6 +562,9 @@ private:
 
     void
     Get_home_location();
+
+    void
+    Download_mission();
 
     bool
     Is_home_position_valid();
@@ -542,6 +606,13 @@ private:
      * Turn on via an entry in conf file. */
     bool enable_joystick_control_for_fixed_wing = false;
 
+    /** if true, then enable GND_ALT_OFFSET calibration during mission upload
+     *  if false, set GND_ALT_OFFSET to zero */
+    bool set_ground_alt_offset = true;
+
+    /** by default autoheading is turned on */
+    bool autoheading = true;
+
     /** If vehicle does not support ROI for multiple WPts then VSM must
      * generate POI commands for each WP until POI(none) received.
      * Leave it true for now until VSM is able to detect Ardupilot FW version.
@@ -549,7 +620,7 @@ private:
      * 3.2+ will keep pointing to current poi POI until POI(0,0,0) received.*/
     bool auto_generate_mission_poi = true;
 
-    Copter_flight_mode current_copter_flight_mode = Copter_flight_mode::LOITER;
+    int current_native_flight_mode = -1;
 
     /** Ardupilot version 3.3.1+ does not have FS_GPS_ENABLE parameter
      * It uses FS_EKF_ACTION for that instead.
@@ -559,6 +630,19 @@ private:
     /** Ardupilot version 3.3.1+ requires Home position
      * to be sent as MAV_CMD instead of mission item. */
     bool send_home_position_as_mav_cmd = false;
+
+    /** MAV_CMD_GET_HOME_POSITION command to retrieve HL from vehicle.
+     * Ardupilot version 3.4.0+ supports MAV_CMD_GET_HOME_POSITION command.
+     * For older version we read waypoint #0 to get HL which can
+     * potentially interfere with route download thus failing the upload if
+     * HL retrieval is in progress.
+     */
+    bool use_get_home_position = false;
+
+    /** Ardupilot version 3.4+ allows to adjust raw altitude with GND_ALT_OFFSET
+     * parameter. Previous versions either don't have this parameter or have a bug
+     */
+    bool gnd_alt_offset_allow = false;
 
     /** Poll for home location until it is nonzero. */
     ugcs::vsm::Timer_processor::Timer::Ptr home_location_timer;
@@ -586,6 +670,9 @@ private:
     // received from ucs.
     constexpr static std::chrono::milliseconds RC_OVERRIDE_TIMEOUT {3000};
 
+    // Poll for HL each 10 seconds until success.
+    constexpr static std::chrono::seconds HL_POLLING_PERIOD {10};
+
     // Counter which governs the end of Joystick mode. To ensure ardupilot
     // exits rc_override we need to spam 0,0,0,0 messages.
     size_t rc_override_end_counter = 0;
@@ -595,6 +682,33 @@ private:
 
     // How many 0,0,0,0 rc_override messages to send to exit joystick mode.
     constexpr static size_t RC_OVERRIDE_END_COUNT = 15;
+
+    ugcs::vsm::Property::Ptr t_adsb_altitude_internal;
+    ugcs::vsm::Property::Ptr t_adsb_transponder_mode;
+    ugcs::vsm::Property::Ptr t_adsb_altitude;
+    ugcs::vsm::Property::Ptr t_adsb_icao;
+    ugcs::vsm::Property::Ptr t_adsb_squawk;
+    ugcs::vsm::Property::Ptr t_adsb_ident_active;
+    ugcs::vsm::Property::Ptr t_adsb_flight;
+    ugcs::vsm::Property::Ptr t_adsb_registration;
+    ugcs::vsm::Property::Ptr t_adsb_error_xpdr;
+    ugcs::vsm::Property::Ptr t_adsb_error_icao;
+    ugcs::vsm::Property::Ptr t_adsb_error_gps;
+    ugcs::vsm::Property::Ptr t_adsb_error_squitter;
+    ugcs::vsm::Property::Ptr t_adsb_error_temperature;
+
+    std::unordered_map<std::string, ugcs::vsm::Property::Ptr> adsb_parameter_map;
+    std::unordered_map<std::string, ugcs::vsm::Property::Ptr> adsb_string_parameter_map;
+
+    bool is_airborne = false;
+
+    // Onboard transponder type if configured.
+    ugcs::vsm::Optional<int> adsb_transponder_type;
+
+    virtual bool
+    Verify_parameter(const std::string& name, float value, ugcs::vsm::mavlink::MAV_PARAM_TYPE& type);
+
+    float current_alt_offset = 0;
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */

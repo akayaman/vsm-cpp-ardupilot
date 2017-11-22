@@ -61,8 +61,6 @@ Supported hardware platforms:
 - APM
 - Pixhawk
 
-_Note: Pixhawk with PX4 autopilot is not supported._
-
 @section mission_execution_specifics Mission execution specifics
 
 @note  If one wants to use automatic take-off, it is strongly recommended to place the first waypoint above the actual location of the vehicle. Otherwise the vehicle will reach for the first waypoint in a straight line thus possibly causing danger.
@@ -141,7 +139,7 @@ Vehicle behavior after returning at Home Location depends on on the configuratio
 Command        | Support  | Notes
 ---------------|----------|---------
 ARM            |  Yes     | Arms vehicle. |
-DISARM         |  Yes     | Disarms vehicle. |
+DISARM         |  Yes     | Disarms vehicle. For copter this works only when vehicle is on the ground. |
 AUTOMODE       |  Yes     | Start mission from first waypoint. Sets vehicle into _Auto_ flight mode. |
 MANUALMODE     |  Yes     | Sets _Manual_ mode. It's @b LOITER for multicopter frames and @b STABILIZE for fixed wing. |
 CLICK & GO     |  Yes     | Sets _Click & Go_ (single waypoint) mode. |
@@ -164,6 +162,8 @@ Joystick device --> UgCS client --> server --> VSM --> Ground Radio --> Air Radi
 If any of the above links fail, the joystick control is broken and vehicle automatically goes into manual mode. (Loiter for copters and Stabilize for planes)
 This is why user should be very careful when working with Joystick control mode.
 It is recommended to have RC transmitter as backup controller.
+
+@note One specific Ardupilot firmware version 3.4.3 does not support Joystick mode. 
 
 @note Joystick control mode is disabled by default for fixed wing frames.
 To enable Joystick mode for planes please refer to section @ref joystick_control_params.
@@ -356,5 +356,28 @@ For some installations GPS altitude from vehicle is more appropriate, e.g. when 
 - @b Example:
 
          vehicle.ardupilot.report_relative_altitude = no
+         
+@subsection telem_rate Telemetry rate configuration
 
+Ardupilot VSM supports setting custom telemetry rate to manage datalink channel bandwidth.
+Rate of 1 produces ~350 bytes/sec of telemetry traffic.
+56K radiolink in ideal conditions can sustain the telemetry_rate = 5. Higher telemetry rates are not recommended and should be tried only with fast datalinks.
+
+- @b Required: No.
+- @b Supported @b values: 1 - 50
+- @b Default: 2
+- @b Description: Set update fequency for vehicle state information (attitude, position, battery, etc...)
+- @b Example:
+
+        vehicle.ardupilot.telemetry_rate = 1
+
+@subsection disarm_delay DISARM_DELAY parameter
+
+- @b Required: No.
+- @b Supported @b values: 0 - 127
+- @b Default: Do not set
+- @b Description: Configure the delay after which vehicle automatically disarms if on the ground. 0 - disable the disarm timer.
+- @b Example:
+
+        vehicle.ardupilot.parameter.DISARM_DELAY = 5
 */

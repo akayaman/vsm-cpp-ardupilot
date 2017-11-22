@@ -1,4 +1,4 @@
-// Copyright (c) 2014, Smart Projects Holdings Ltd
+// Copyright (c) 2017, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
@@ -8,8 +8,6 @@
 #include <ugcs/vsm/callback.h>
 #include <ugcs/vsm/run_as_service.h>
 #include <ardupilot_vehicle_manager.h>
-
-#define ADSB_DISABLED
 
 #ifdef __unix__
 #include <signal.h>
@@ -34,11 +32,6 @@ start_main(int argc, char *argv[])
     ugcs::vsm::Initialize(argc, argv, "vsm-ardupilot.conf");
     manager = Ardupilot_vehicle_manager::Create();
     manager->Enable();
-
-#ifndef ADSB_DISABLED
-    adsb_manager = Adsb_manager::Create("vehicle.ardupilot.serial_port");
-    adsb_manager->Enable();
-#endif
     return 0;
 }
 
@@ -47,11 +40,6 @@ stop_main()
 {
     manager->Disable();
     manager = nullptr;
-
-#ifndef ADSB_DISABLED
-    adsb_manager->Disable();
-    adsb_manager = nullptr;
-#endif
     ugcs::vsm::Terminate();
 }
 

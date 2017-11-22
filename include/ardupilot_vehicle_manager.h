@@ -1,4 +1,4 @@
-// Copyright (c) 2014, Smart Projects Holdings Ltd
+// Copyright (c) 2017, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
@@ -34,6 +34,21 @@ private:
 
     virtual void
     Register_detectors() override;
+
+    /** Disable the manager. */
+    virtual void
+    On_manager_disable() override;
+
+    void
+    Schedule_injection_read(Mavlink_vehicle::Mavlink_stream::Ptr);
+
+    void
+    Handle_new_injector(std::string, int, ugcs::vsm::Socket_address::Ptr, ugcs::vsm::Io_stream::Ref);
+
+    void
+    On_command_long(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::COMMAND_LONG>::Ptr message);
+
+    std::unordered_map<Mavlink_vehicle::Mavlink_stream::Ptr, ugcs::vsm::Operation_waiter> injection_readers;
 
 };
 
