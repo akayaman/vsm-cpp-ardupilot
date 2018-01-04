@@ -19,11 +19,8 @@ if (NOT DEFINED VSM_SDK_DIR)
 endif()
 
 set(UGCS_PACKAGE_SUMMARY "UgCS vehicle specific module (VSM) for vehicles driven by Ardupilot")
-
 set(UGCS_VSM_USER_GUIDE_LATEX_TITLE "Ardupilot VSM User Guide")
-
 set(CMAKE_MODULE_PATH "${VSM_SDK_DIR}/share/cmake")
-
 include("ugcs/vsm")
 
 Build_vsm_config(${CMAKE_SOURCE_DIR}/vsm.conf)
@@ -35,13 +32,6 @@ endif()
 include_directories (include "${COMMON_SOURCES}/include")
 
 file(GLOB SOURCES "src/*.cpp" "${COMMON_SOURCES}/src/*mavlink*.cpp") 
+file(GLOB HEADERS "include/*.h" "${COMMON_SOURCES}/include/*mavlink*.h") 
 
-# Add the executable
-add_executable(${VSM_EXECUTABLE_NAME} ${SOURCES})
-
-target_link_libraries(${VSM_EXECUTABLE_NAME} ${VSM_LIBS})
-
-Add_install_target()
-
-#Add package target.
-include(CPack)
+Build_vsm()

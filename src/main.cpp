@@ -2,16 +2,12 @@
 // All rights reserved.
 // See LICENSE file for license details.
 
-#include <iostream>
-#include <signal.h>
 #include <ugcs/vsm/vsm.h>
 #include <ugcs/vsm/callback.h>
 #include <ugcs/vsm/run_as_service.h>
 #include <ardupilot_vehicle_manager.h>
-
-#ifdef __unix__
 #include <signal.h>
-#endif /* __unix__ */
+#include <iostream>
 
 bool terminate;
 
@@ -46,14 +42,14 @@ stop_main()
 void
 wait_for_termination()
 {
-    while(!terminate) {
+    while (!terminate) {
         /* Think about better way. */
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
 int
-main (int argc, char *argv[])
+main(int argc, char *argv[])
 {
     auto ret = ugcs::vsm::Run_as_service(
             "ugcs-vsm-ardupilot",

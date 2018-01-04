@@ -52,19 +52,55 @@ void
 Ardupilot_vehicle_manager::Handle_new_injector(
     std::string, int, ugcs::vsm::Socket_address::Ptr, ugcs::vsm::Io_stream::Ref stream)
 {
-    auto mav_stream = Mavlink_vehicle::Mavlink_stream::Create(stream);
+    auto mav_stream = ugcs::vsm::Mavlink_stream::Create(stream);
     mav_stream->Bind_decoder_demuxer();
-    mav_stream->Get_demuxer().
-            Register_handler<mavlink::MESSAGE_ID::COMMAND_LONG, mavlink::Extension>(
-            Mavlink_demuxer::Make_handler<mavlink::MESSAGE_ID::COMMAND_LONG, mavlink::Extension>(
-                    &Ardupilot_vehicle_manager::On_command_long,
+    mav_stream->Get_demuxer().Register_default_handler(
+        Mavlink_demuxer::Make_default_handler(
+                    &Ardupilot_vehicle_manager::Default_mavlink_handler,
                     Shared_from_this()));
+
     LOG_INFO("MAVlink injection enabled on %s", stream->Get_name().c_str());
     Schedule_injection_read(mav_stream);
 }
 
+bool
+Ardupilot_vehicle_manager::Default_mavlink_handler(
+    ugcs::vsm::Io_buffer::Ptr buf,
+    ugcs::vsm::mavlink::MESSAGE_ID_TYPE message_id,
+    uint8_t sys,
+    uint8_t cmp,
+    uint8_t)
+{
+    int target = -1;
+    switch (message_id) {
+    case mavlink::MESSAGE_ID::COMMAND_LONG:
+        target = mavlink::Message<mavlink::MESSAGE_ID::COMMAND_LONG>::Create(0, 0, 0, buf)->payload->target_system;
+        break;
+    case mavlink::MESSAGE_ID::COMMAND_INT:
+        target = mavlink::Message<mavlink::MESSAGE_ID::COMMAND_INT>::Create(0, 0, 0, buf)->payload->target_system;
+        break;
+    case mavlink::MESSAGE_ID::GPS_INJECT_DATA:
+        target = mavlink::Message<mavlink::MESSAGE_ID::GPS_INJECT_DATA>::Create(0, 0, 0, buf)->payload->target_system;
+        break;
+    case mavlink::MESSAGE_ID::GPS_RTCM_DATA:
+        // Messages which do not have target are broadcasted to all vehicles.
+        for (auto it : vehicles) {
+            it.second.vehicle->Inject_message(message_id, sys, cmp, buf);
+        }
+        break;
+    default:
+        return false;
+    }
+    // If message has target then send to that specific vehicle.
+    auto it = vehicles.find(target);
+    if (it != vehicles.end()) {
+        it->second.vehicle->Inject_message(message_id, sys, cmp, buf);
+    }
+    return false;
+}
+
 void
-Ardupilot_vehicle_manager::Schedule_injection_read(Mavlink_vehicle::Mavlink_stream::Ptr mav_stream)
+Ardupilot_vehicle_manager::Schedule_injection_read(ugcs::vsm::Mavlink_stream::Ptr mav_stream)
 {
     auto stream = mav_stream->Get_stream();
     if (stream) {
@@ -83,7 +119,7 @@ Ardupilot_vehicle_manager::Schedule_injection_read(Mavlink_vehicle::Mavlink_stre
                     max_read,
                     to_read,
                     Make_read_callback(
-                        [this](Io_buffer::Ptr buffer, Io_result result, Mavlink_vehicle::Mavlink_stream::Ptr mav_stream)
+                        [this](Io_buffer::Ptr buffer, Io_result result, ugcs::vsm::Mavlink_stream::Ptr mav_stream)
                         {
                             if (result == Io_result::OK) {
                                 mav_stream->Get_decoder().Decode(buffer);
@@ -102,15 +138,6 @@ Ardupilot_vehicle_manager::Schedule_injection_read(Mavlink_vehicle::Mavlink_stre
             mav_stream->Disable();
             stream->Close();
         }
-    }
-}
-
-void
-Ardupilot_vehicle_manager::On_command_long(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::COMMAND_LONG>::Ptr message)
-{
-    auto it = vehicles.find(message->payload->target_system.Get());
-    if (it != vehicles.end()) {
-        it->second.vehicle->Send_message(message->payload);
     }
 }
 

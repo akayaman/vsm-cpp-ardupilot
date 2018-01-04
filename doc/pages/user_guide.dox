@@ -50,6 +50,7 @@ location on map.
 Supported vehicle types:
 - Copters
 - Planes
+- VTOL
 
 Supported Ardupilot firmware versions:
 - 3.0
@@ -60,6 +61,8 @@ Supported Ardupilot firmware versions:
 Supported hardware platforms:
 - APM
 - Pixhawk
+
+@note When working with VTOL vehicles make sure the Q_MAV_TYPE correctly.
 
 @section mission_execution_specifics Mission execution specifics
 

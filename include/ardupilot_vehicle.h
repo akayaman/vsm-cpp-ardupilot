@@ -11,6 +11,7 @@
 #include <mavlink_vehicle.h>
 
 #define ARDUPILOT_VERSION(maj, min, patch) ((maj << 24) + (min << 16) + (patch << 8))
+#define DISARM_MAGIC_VALUE 21196.0f
 
 /** Vehicle supporting Ardupilot specific flavor of Mavlink. */
 class Ardupilot_vehicle: public Mavlink_vehicle {
@@ -83,7 +84,6 @@ public:
     /** Ardupilot specific activity. */
     class Ardupilot_activity : public Activity {
     public:
-
         /** Constructor based on Ardupilot vehicle class. */
         Ardupilot_activity(Ardupilot_vehicle& ardu_vehicle) :
             Activity(ardu_vehicle),
@@ -96,7 +96,6 @@ public:
     /** Data related to vehicle command processing. */
     class Vehicle_command_act : public Ardupilot_activity {
     public:
-
         using Ardupilot_activity::Ardupilot_activity;
 
         /** Try execute command a vehicle. */
@@ -118,13 +117,17 @@ public:
         On_param_value(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr);
 
         void
-        On_point_value(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::FENCE_POINT, ugcs::vsm::mavlink::apm::Extension>::Ptr);
+        On_point_value(
+            ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::FENCE_POINT,
+            ugcs::vsm::mavlink::apm::Extension>::Ptr);
 
         void
         On_mission_current(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::MISSION_CURRENT>::Ptr);
 
         void
-        On_param_str_value(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE, ugcs::vsm::mavlink::sph::Extension>::Ptr);
+        On_param_str_value(
+            ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE,
+            ugcs::vsm::mavlink::sph::Extension>::Ptr);
 
         void
         Send_next_command();
@@ -208,7 +211,6 @@ public:
     /** Data related to task upload processing. */
     class Task_upload: public Ardupilot_activity {
     public:
-
         using Ardupilot_activity::Ardupilot_activity;
 
         /** Calls appropriate prepare action based on type. */
@@ -267,6 +269,9 @@ public:
 
         void
         Prepare_camera_trigger(ugcs::vsm::Action::Ptr&);
+
+        void
+        Prepare_vtol_transition(ugcs::vsm::Action::Ptr&);
 
         void
         Prepare_set_servo(ugcs::vsm::Action::Ptr&);
@@ -427,7 +432,6 @@ public:
              camera_series_by_time_active = false,
         /** CAMERA_SERIES_BY_DISTANCE was activated in current waypoint. */
              camera_series_by_time_active_in_wp = false;
-
     } task_upload;
 
 
@@ -467,7 +471,6 @@ public:
     On_home_location_timer();
 
 private:
-
     /** Flight modes of the Ardupilot Copter mode. */
     enum class Copter_flight_mode {
         /** Hold level position. */
@@ -647,7 +650,7 @@ private:
     /** Poll for home location until it is nonzero. */
     ugcs::vsm::Timer_processor::Timer::Ptr home_location_timer;
 
-    ugcs::vsm::Geodetic_tuple home_location {0,0,0};
+    ugcs::vsm::Geodetic_tuple home_location {0, 0, 0};
 
     /** Joystick mode support */
 
@@ -709,6 +712,9 @@ private:
     Verify_parameter(const std::string& name, float value, ugcs::vsm::mavlink::MAV_PARAM_TYPE& type);
 
     float current_alt_offset = 0;
+
+    // This is a plane capable of VTOL.
+    bool vtol_plane = false;
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */
