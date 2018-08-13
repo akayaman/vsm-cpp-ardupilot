@@ -1,4 +1,4 @@
-// Copyright (c) 2017, Smart Projects Holdings Ltd
+// Copyright (c) 2018, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
@@ -9,12 +9,13 @@
 #define _ARDUPILOT_VEHICLE_H_
 
 #include <mavlink_vehicle.h>
+#include <adsb_aircraft.h>
 
 #define ARDUPILOT_VERSION(maj, min, patch) ((maj << 24) + (min << 16) + (patch << 8))
-#define DISARM_MAGIC_VALUE 21196.0f
+#define DISARM_MAGIC_VALUE 21196.0f 
 
 /** Vehicle supporting Ardupilot specific flavor of Mavlink. */
-class Ardupilot_vehicle: public Mavlink_vehicle {
+class Ardupilot_vehicle : public Mavlink_vehicle {
     DEFINE_COMMON_CLASS(Ardupilot_vehicle, Mavlink_vehicle)
 
 public:
@@ -25,16 +26,24 @@ public:
             ugcs::vsm::mavlink::MAV_TYPE type,
             ugcs::vsm::Io_stream::Ref stream,
             ugcs::vsm::Optional<std::string> mission_dump_path,
+            const std::string& serial,
+            const std::string& model,
             Args &&... args) :
             Mavlink_vehicle(
-                    system_id, component_id, type,
-                    ugcs::vsm::mavlink::MAV_AUTOPILOT::MAV_AUTOPILOT_ARDUPILOTMEGA,
-                    Vehicle::Capabilities(),
-                    stream, mission_dump_path, std::forward<Args>(args)...),
+                    system_id,
+                    component_id,
+                    Vendor::ARDUPILOT,
+                    type,
+                    stream,
+                    mission_dump_path,
+                    serial,
+                    model,
+                    std::forward<Args>(args)...),
             vehicle_command(*this),
             task_upload(*this)
     {
-        autopilot_type = "ardupilot";
+        Set_autopilot_type("ardupilot");
+
         /* Consider this as uptime start. */
         recent_connect = std::chrono::steady_clock::now();
         Configure();
@@ -47,39 +56,8 @@ public:
     virtual void
     On_disable();
 
-    /** Distinguishable type of Ardupilot vehicle. This is mainly driven by
-     * Ardupilot firmware flavors each having some minor differences. */
-    enum Type {
-        /** Copter (quad, octa, hexa etc). */
-        COPTER,
-        /** Fixed wing plane. */
-        PLANE,
-        /** Rovers, cars. */
-        ROVER,
-        /** Other unsupported/unknown vehicle type, depending on the context.*/
-        OTHER
-    };
-
-    /** UCS has sent a task for a vehicle. */
-    virtual void
-    Handle_vehicle_request(ugcs::vsm::Vehicle_task_request::Handle request) override;
-
-    /**
-     * UCS requesting command execution on a vehicle.
-     */
-    virtual void
-    Handle_vehicle_request(ugcs::vsm::Vehicle_command_request::Handle request) override;
-
     virtual void
     Handle_ucs_command(ugcs::vsm::Ucs_request::Ptr ucs_request);
-
-    /** Get the Type of the vehicle. */
-    Type
-    Get_type() const;
-
-    /** Get the Type of the vehicle based on Mavlink type. */
-    static Type
-    Get_type(ugcs::vsm::mavlink::MAV_TYPE);
 
     /** Ardupilot specific activity. */
     class Ardupilot_activity : public Activity {
@@ -91,6 +69,13 @@ public:
 
         /** Managed Ardupilot vehicle. */
         Ardupilot_vehicle& ardu_vehicle;
+
+        /** new style command request. */
+        ugcs::vsm::Ucs_request::Ptr ucs_request = nullptr;
+
+        /** Disable the activity. */
+        void
+        Disable(const std::string& status);
     };
 
     /** Data related to vehicle command processing. */
@@ -142,8 +127,8 @@ public:
         Enable();
 
         /** Disable the activity. */
-        void
-        Disable(const std::string& status);
+        virtual void
+        On_disable() override;
 
         void
         Disable_success();
@@ -164,11 +149,6 @@ public:
         void
         Unregister_status_text();
 
-        /** Get the value of custom mode corresponding to AUTO mode of the
-         * current vehicle type. */
-        uint32_t
-        Get_custom_auto_mode();
-
         /** Get the value of custom mode corresponding to reasonable manual mode
          * of the current vehicle type. */
         uint32_t
@@ -178,12 +158,6 @@ public:
          * of the current vehicle type. */
         uint32_t
         Get_custom_guided_mode();
-
-        /** Current command request. */
-        ugcs::vsm::Vehicle_command_request::Handle vehicle_command_request;
-
-        /** new style command request. */
-        ugcs::vsm::Ucs_request::Ptr ucs_request = nullptr;
 
         /** Mavlink messages to be sent to execute current command. */
         std::list<ugcs::vsm::mavlink::Payload_base::Ptr> cmd_messages;
@@ -206,16 +180,108 @@ public:
         bool
         Is_Outside_Polygon(double check_point_latitude, double check_point_longitude,
                            ugcs::vsm::proto::List_value lats, ugcs::vsm::proto::List_value lngs);
+
+        float command_count = 0; // for progress reporting
+
+    private:
+        void
+        Process_guided();
+
+        void
+        Process_joystick();
+
+        void
+        Process_auto();
+
+        void
+        Process_manual();
+
+        void
+        Process_arm();
+
+        void
+        Process_disarm();
+
+        void
+        Process_pause();
+
+        void
+        Process_resume();
+
+        // throws if a parameter is missing.
+        void
+        Process_waypoint(const ugcs::vsm::Property_list& params);
+
+        // throws if a parameter is missing.
+        void
+        Process_direct_vehicle_control(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_land();
+
+        void
+        Process_rth();
+
+        void
+        Process_relative_heading(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_heading(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_takeoff(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_reboot();
+
+        void
+        Process_calibration();
+
+        void
+        Process_set_fence(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_repeat_servo(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_set_servo(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_adsb_set_mode(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_adsb_set_ident();
+
+        void
+        Process_adsb_set_parameter(const ugcs::vsm::Property_list& params);
+
+        // throws if a parameter is invalid (not float).
+        void
+        Process_write_parameter(const ugcs::vsm::Property_list& params);
+
+        void
+        Process_emergency_land();
+
+        // Workaround for set_heading not working if not preceded by WP.
+        void
+        Generate_wp_from_current_position();
+
+        void
+        Process_camera_trigger();
+
+        // Stop camera trigger by time/distance if active.
+        void
+        Stop_camera_series();
     } vehicle_command;
+
 
     /** Data related to task upload processing. */
     class Task_upload: public Ardupilot_activity {
     public:
-        using Ardupilot_activity::Ardupilot_activity;
-
-        /** Calls appropriate prepare action based on type. */
-        void
-        Prepare_action(ugcs::vsm::Action::Ptr);
+        Task_upload(Ardupilot_vehicle& vehicle):
+            Ardupilot_activity(vehicle),
+            task_attributes(vehicle.real_system_id, vehicle.real_component_id)
+        {}
 
         /** Add mission item to prepared actions. Common mission item
          * initialization are made, like sequence number generation.
@@ -229,61 +295,61 @@ public:
          * @return Created mission item. */
 
         void
-        Prepare_move(ugcs::vsm::Action::Ptr&);
+        Prepare_move(const ugcs::vsm::Property_list&);
 
         void
-        Prepare_wait(ugcs::vsm::Action::Ptr&);
+        Prepare_wait(const ugcs::vsm::Property_list&);
 
         void
-        Prepare_payload_steering(ugcs::vsm::Action::Ptr&);
+        Prepare_takeoff_mission(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_takeoff(ugcs::vsm::Action::Ptr&);
+        Prepare_landing(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_landing(ugcs::vsm::Action::Ptr&);
+        Prepare_change_speed(const ugcs::vsm::Property_list&);
 
         void
-        Prepare_change_speed(ugcs::vsm::Action::Ptr&);
+        Prepare_set_home(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_set_home(ugcs::vsm::Action::Ptr&);
+        Prepare_poi(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_POI(ugcs::vsm::Action::Ptr&);
+        Prepare_heading(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_heading(ugcs::vsm::Action::Ptr&);
+        Prepare_panorama(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_panorama(ugcs::vsm::Action::Ptr&);
+        Prepare_camera_series_by_distance(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_camera_control(ugcs::vsm::Action::Ptr&);
+        Prepare_camera_series_by_time(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_camera_series_by_distance(ugcs::vsm::Action::Ptr&);
+        Prepare_camera_trigger(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_camera_series_by_time(ugcs::vsm::Action::Ptr&);
+        Prepare_vtol_transition(bool vtol);
 
         void
-        Prepare_camera_trigger(ugcs::vsm::Action::Ptr&);
+        Prepare_wait_until(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_vtol_transition(ugcs::vsm::Action::Ptr&);
+        Prepare_set_servo(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_set_servo(ugcs::vsm::Action::Ptr&);
+        Prepare_repeat_servo(const ugcs::vsm::Property_list& params);
 
         void
-        Prepare_repeat_servo(ugcs::vsm::Action::Ptr&);
+        Prepare_payload_control(const ugcs::vsm::Property_list& params);
 
         //@}
 
         /** Build waypoint mission item based on move action. */
         ugcs::vsm::mavlink::Pld_mission_item::Ptr
-        Build_wp_mission_item(ugcs::vsm::Action::Ptr&);
+        Build_wp_mission_item(const ugcs::vsm::Property_list& params);
 
         /** Build ROI mission item based on given coordinates */
         ugcs::vsm::mavlink::Pld_mission_item::Ptr
@@ -298,59 +364,34 @@ public:
                 bool clockwise = true);
 
         void
+        Stop_camera_series();
+
+        void
         Add_camera_trigger_item();
 
         /** Previous activity is completed, enable class and start task upload. */
         void
-        Enable(ugcs::vsm::Vehicle_task_request::Handle);
+        Enable();
 
         /** Disable this class and cancel any existing request. */
         virtual void
         On_disable() override;
 
-        /** Filter unsupported actions. */
+        /** Prepare task attributes depending on the vehicle type. */
         void
-        Filter_actions();
+        Prepare_task_attributes(const ugcs::vsm::Property_list& params);
 
-        /** Filter actions unsupported by copters. */
+        // Validates the mission
+        // Throws Invalid_param_exception
         void
-        Filter_copter_actions();
-
-        /** Filter actions unsupported by planes. */
-        void
-        Filter_plane_actions();
-
-        /** Filter actions unsupported by rovers. */
-        void
-        Filter_rover_actions();
-
-        /** Filter actions unsupported by other types of vehicles. */
-        void
-        Filter_other_actions();
+        Preprocess_mission(const ugcs::vsm::proto::Device_command& vsm_cmd);
 
         /** Prepare the task for uploading to the vehicle. */
         void
-        Prepare_task();
+        Prepare_mission(const ugcs::vsm::proto::Device_command& vsm_cmd);
 
-        /** Prepare task attributes depending on the vehicle type. */
         void
-        Prepare_task_attributes();
-
-        /** Prepare copter task attributes. */
-        void
-        Prepare_copter_task_attributes();
-
-        /** Prepare plane task attributes. */
-        void
-        Prepare_plane_task_attributes();
-
-        /** Prepare rover task attributes. */
-        void
-        Prepare_rover_task_attributes();
-
-        /** Prepare task attributes of other vehicles. */
-        void
-        Prepare_other_task_attributes();
+        Prepare_set_parameters(const ugcs::vsm::Property_list& params);
 
         /** Task attributes upload handler. */
         void
@@ -390,9 +431,25 @@ public:
         void
         Fill_mavlink_mission_item_common(ugcs::vsm::mavlink::Pld_mission_item& msg);
 
+        ugcs::vsm::mavlink::Pld_mission_item::Ptr
+        Create_mission_item();
 
-        /** Current task for uploading, if any. */
-        ugcs::vsm::Vehicle_task_request::Handle request;
+        ugcs::vsm::mavlink::Pld_mission_item::Ptr
+        Create_mission_item_with_coords(const ugcs::vsm::Property_list& params);
+
+        ugcs::vsm::mavlink::Pld_command_long::Ptr
+        Create_command_long_with_coords(const ugcs::vsm::Property_list& params);
+
+        ugcs::vsm::Geodetic_tuple
+        Create_geodetic_tuple(const ugcs::vsm::Property_list& params);
+
+        // Called on each mission item during upload
+        void
+        On_upload_progress(int seqnum);
+
+        // Called on each mission item during download
+        void
+        On_download_progress(int seqnum);
 
         /** Prepared Mavlink actions to be uploaded to the vehicle and built based
          * on the actions from the original request. Original actions could be
@@ -406,7 +463,7 @@ public:
         Write_parameters::List task_attributes;
 
         /** Previous move action, if any. */
-        ugcs::vsm::Action::Ptr last_move_action;
+        ugcs::vsm::Optional<ugcs::vsm::Property_list> last_move_params;
 
         /** Active POI from mission. */
         ugcs::vsm::Optional<ugcs::vsm::Geodetic_tuple> current_mission_poi;
@@ -420,8 +477,12 @@ public:
         /** Mission POI action must be added as it was cancelled by previous actions.*/
         bool restart_mission_poi = false;
 
-        float current_heading = 0.0;
+        float current_heading;
 
+        // current speed in mission.
+        float current_speed = -1;
+
+        // used only when autoheading is on.
         float heading_to_this_wp = 0.0;
 
         /** CAMERA_SERIES_BY_DISTANCE was activated. */
@@ -432,6 +493,18 @@ public:
              camera_series_by_time_active = false,
         /** CAMERA_SERIES_BY_DISTANCE was activated in current waypoint. */
              camera_series_by_time_active_in_wp = false;
+
+        float altitude_origin = 0;
+        float safe_altitude = 0;
+        float home_altitude = 0;
+
+        int current_route_command_index = -1;  // for command map
+        float command_count = 0; // for progress reporting
+        float item_count = 0; // for progress reporting
+        float param_count = 0; // for progress reporting
+        float total_count = 0; // for progress reporting
+        // home location
+        ugcs::vsm::Property_list hl_params;
     } task_upload;
 
 
@@ -448,6 +521,9 @@ public:
     On_parameter(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr);
 
     void
+    On_adsb_vehicle(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::ADSB_VEHICLE>::Ptr);
+
+    void
     On_string_parameter(
         ugcs::vsm::mavlink::Message<
             ugcs::vsm::mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE,
@@ -455,6 +531,9 @@ public:
 
     void
     On_mission_item(ugcs::vsm::mavlink::Pld_mission_item);
+
+    void
+    On_mission_request(int seq);
 
     void
     Report_home_location(double lat, double lon, float alt);
@@ -470,68 +549,71 @@ public:
     bool
     On_home_location_timer();
 
+    bool
+    On_adsb_vehicles_timer();
+
 private:
-    /** Flight modes of the Ardupilot Copter mode. */
+    /** Flight modes of the Ardupilot Copter mode. Copied from ArduCopter/defines.h*/
     enum class Copter_flight_mode {
-        /** Hold level position. */
-        STABILIZE = 0,
-        /** Rate control. */
-        ACRO = 1,
-        /** AUTO control. */
-        ALT_HOLD = 2,
-        /** AUTO control. */
-        AUTO = 3,
-        /** AUTO control. */
-        GUIDED = 4,
-        /** Hold a single location. */
-        LOITER = 5,
-        /** AUTO control. */
-        RTL = 6,
-        /** AUTO control. */
-        CIRCLE = 7,
-        /** AUTO control. */
-        LAND = 9,
-        /** Hold a single location using optical flow sensor. */
-        OF_LOITER = 10,
-        /** DRIFT mode (Note: 12 is no longer used). */
-        DRIFT = 11,
-        /** Earth frame rate control. */
-        SPORT = 13,
-        /** Flip the vehicle on the roll axis. */
-        FLIP = 14,
-        /** Autotune the vehicle's roll and pitch gains. */
-        AUTOTUNE = 15
+        STABILIZE =     0,  // manual airframe angle with manual throttle
+        ACRO =          1,  // manual body-frame angular rate with manual throttle
+        ALT_HOLD =      2,  // manual airframe angle with automatic throttle
+        AUTO =          3,  // fully automatic waypoint control using mission commands
+        GUIDED =        4,  // fully automatic fly to coordinate or fly at velocity/direction using GCS immediate cmds
+        LOITER =        5,  // automatic horizontal acceleration with automatic throttle
+        RTL =           6,  // automatic return to launching point
+        CIRCLE =        7,  // automatic circular flight with automatic throttle
+        LAND =          9,  // automatic landing with horizontal position control
+        OF_LOITER =    10,  // Hold a single location using optical flow sensor.
+        DRIFT =        11,  // semi-automous position, yaw and throttle control
+        SPORT =        13,  // manual earth-frame angular rate control with manual throttle
+        FLIP =         14,  // automatically flip the vehicle on the roll axis
+        AUTOTUNE =     15,  // automatically tune the vehicle's roll and pitch gains
+        POSHOLD =      16,  // automatic position hold with manual override, with automatic throttle
+        BRAKE =        17,  // full-brake using inertial/GPS system, no pilot input
+        THROW =        18,  // throw to launch mode using inertial/GPS system, no pilot input
+        AVOID_ADSB =   19,  // automatic avoidance of obstacles in the macro scale - e.g. full-sized aircraft
+        GUIDED_NOGPS = 20,  // guided mode but only accepts attitude and altitude
+        SMART_RTL =    21,  // SMART_RTL returns to home by retracing its steps
     };
 
     // @{
-    /** Flight modes of the Ardupilot Plane mode. */
+    /** Flight modes of the Ardupilot Plane mode. Copied form ArduPlane/defines.h */
     enum class Plane_flight_mode {
-        MANUAL = 0,
-        CIRCLE = 1,
-        STABILIZE = 2,
-        TRAINING = 3,
-        ACRO = 4,
+        MANUAL        = 0,
+        CIRCLE        = 1,
+        STABILIZE     = 2,
+        TRAINING      = 3,
+        ACRO          = 4,
         FLY_BY_WIRE_A = 5,
         FLY_BY_WIRE_B = 6,
-        CRUISE = 7,
-        AUTO = 10,
-        RTL = 11,
-        LOITER = 12,
-        GUIDED = 15,
-        INITIALISING = 16
+        CRUISE        = 7,
+        AUTOTUNE      = 8,
+        AUTO          = 10,
+        RTL           = 11,
+        LOITER        = 12,
+        AVOID_ADSB    = 14,
+        GUIDED        = 15,
+        INITIALISING  = 16,
+        QSTABILIZE    = 17,
+        QHOVER        = 18,
+        QLOITER       = 19,
+        QLAND         = 20,
+        QRTL          = 21
     };
     // @}
 
     // @{
-    /** Flight modes of the Ardupilot Rover mode. */
+    /** Flight modes of the Ardupilot Rover mode. Copied form APMrover2/defines.h */
     enum class Rover_flight_mode {
-        MANUAL = 0,
-        LEARNING = 2,
-        STEERING = 3,
-        HOLD = 4,
-        AUTO = 10,
-        RTL = 11,
-        GUIDED = 15,
+        MANUAL       = 0,
+        ACRO         = 1,
+        STEERING     = 3,
+        HOLD         = 4,
+        AUTO         = 10,
+        RTL          = 11,
+        SMART_RTL    = 12,
+        GUIDED       = 15,
         INITIALISING = 16
     };
     // @}
@@ -541,6 +623,9 @@ private:
     Process_heartbeat(
             ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::HEARTBEAT>::Ptr) override;
 
+    virtual void
+    Initialize_telemetry();
+
     /** Map custom flight mode from the heartbeat to our flight mode. */
     void
     Update_flight_mode(int);
@@ -548,8 +633,8 @@ private:
     const char*
     Get_native_flight_mode_name(int);
 
-    Sys_status::Control_mode
-    Map_control_mode(int);
+    void
+    Update_control_mode(int);
 
     /** Updates current capabilities based on vehicle type. */
     void
@@ -590,6 +675,15 @@ private:
     void
     Set_rc_override(int p, int r, int t, int y);
 
+    void
+    On_version_processed(bool success, std::string);
+
+    // True if detected ardupilot version is less than given number.
+    bool
+    Is_version_less_than(uint32_t maj, uint32_t min, uint32_t patch) {
+        return (ardupilot_version < (maj << 24) + (min << 16) + (patch << 8));
+    }
+
     /**
      * Minimal waypoint acceptance radius to use.
      */
@@ -599,11 +693,11 @@ private:
     std::chrono::steady_clock::time_point recent_connect;
 
     /** Index of servo to use for camera trigger. */
-    int camera_servo_idx;
+    int camera_servo_idx = -1;  // Not configured by default.
     /** PWM value to set for camera trigger. */
-    int camera_servo_pwm;
+    int camera_servo_pwm = -1;
     /** Time to hold camera servo at the specified PWM when triggering. */
-    float camera_servo_time;
+    float camera_servo_time = -1;
 
     /** By default joystick mode is disabled for planes.
      * Turn on via an entry in conf file. */
@@ -629,6 +723,16 @@ private:
      * It uses FS_EKF_ACTION for that instead.
      */
     bool use_ekf_action_as_gps_failsafe = false;
+
+    /** Ardupilot version 3.6+ renamed FS_BATT_ to BATT_FS_
+     */
+    bool use_batt_fs_as_batt_failsafe = false;
+
+    /** Ardupilot version 3.6+ allows to issue DO_SET_CAM_TRIGG_DIST in MAV_CMD_LONG
+     * Prior to that the only way to terminate trigger by distance is to reach WP with
+     * DO_SET_CAM_TRIGG_DIST(0)
+     */
+    bool do_set_cam_trig_dist_as_command = false;
 
     /** Ardupilot version 3.3.1+ requires Home position
      * to be sent as MAV_CMD instead of mission item. */
@@ -676,6 +780,15 @@ private:
     // Poll for HL each 10 seconds until success.
     constexpr static std::chrono::seconds HL_POLLING_PERIOD {10};
 
+    // Generate CHANGE_SPEED command only if new speed differs from current speed more than this.
+    constexpr static float CHANGE_SPEED_TRESHOLD = 0.1;
+
+    // Generate MAV_CMD_CONDITION_YAW command only if new heading differs from current more than this radians.
+    constexpr static float CHANGE_HEADING_TRESHOLD = 0.01;
+
+    // Use this if altitude not given in takeoff_command
+    constexpr static float DEFAULT_TAKEOFF_ALTITUDE = 5.0;
+
     // Counter which governs the end of Joystick mode. To ensure ardupilot
     // exits rc_override we need to spam 0,0,0,0 messages.
     size_t rc_override_end_counter = 0;
@@ -705,16 +818,35 @@ private:
 
     bool is_airborne = false;
 
+    // Workaround the bug in ardupilot which ignores MAV_CMD_CONDITION_YAW command if there is no
+    // WP command executed previously. Used to support set_heading just after takeoff.
+    bool set_heading_needs_wp = true;
+
+    // workaround for cases when user does not want to have set_speed on each WP.
+    bool ignore_speed_in_route = false;
+
+    // disable mission download after upload. Downlad may take too much time for large missions
+    bool disable_mission_download = false;
+
     // Onboard transponder type if configured.
     ugcs::vsm::Optional<int> adsb_transponder_type;
 
     virtual bool
     Verify_parameter(const std::string& name, float value, ugcs::vsm::mavlink::MAV_PARAM_TYPE& type);
 
-    float current_alt_offset = 0;
+    ugcs::vsm::Optional<float> current_alt_offset;
 
-    // This is a plane capable of VTOL.
-    bool vtol_plane = false;
+    // Map of ADSB detected aircrafts (icao code -> adsb vehicle)
+    std::unordered_map<uint32_t, Adsb_aircraft::Ptr> adsb_vehicles;
+
+    // check regularly and unregister stale adsb vehicles.
+    ugcs::vsm::Timer_processor::Timer::Ptr adsb_vehicles_timer;
+
+    // if there is no update for 1 minute consider vehicle out of range.
+    constexpr static std::chrono::seconds ADSB_VEHICLE_TIMEOUT {60};
+
+    // Autopilot version
+    uint32_t ardupilot_version = 0;
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */

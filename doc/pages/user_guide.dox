@@ -53,14 +53,7 @@ Supported vehicle types:
 - VTOL
 
 Supported Ardupilot firmware versions:
-- 3.0
-- 3.1.x
-- 3.2.x
-- 3.3.x
-
-Supported hardware platforms:
-- APM
-- Pixhawk
+- Any version starting from 3.0.0 and up to 3.6.0
 
 @note When working with VTOL vehicles make sure the Q_MAV_TYPE correctly.
 
@@ -73,24 +66,21 @@ Flight plan element / action | Support | Notes
 -----------------------------|---------|---------
 Change speed    |  Partial | Changing of flight speed during the mission may work only on latest 3.3.x firmware.
 Panorama        |  Partial | Only clock-wise movement is supported due to Ardupilot firmware bug. UgCS provides correct angle values according to Mavlink specification.
-Set camera mode |  Partial | Only photo mode is supported. |
-Set camera by time | Partial | "First shot delay" parameter is not supported. |
-Set camera by distance | Partial | Only "Distance" parameter is supported. |
+Set camera mode |  Partial | Only photo mode is supported. See @ref camera_trigger |
+Set camera by time | Partial | "First shot delay" parameter is not supported. See note below. |
+Set camera by distance | Partial | Only "Distance" parameter is supported. See note below. |
 Set camera attitude | No | |
 Set POI | Yes | |
 Change yaw | Yes | |
 
-__Camera control__
+@note __Camera series by time and by distance__<br>
+When mission includes a camera series (by time or by distance) action and mission flight is interrupted by issuing any command that interferes with mission (eg. Hold, Click&Go, RTH) during active camera series then
+triggering will stop until vehicle reaches the next waypoint with camera trigger action.
 
-For using camera you should set up necessary parameters in ArduPilot native 
-software according to your hardware configuration. See also @ref camera_control_params
-- VSM configuration should match your copter configuration. See ArduCopter
-manual for details.
-
-For example, in MissionPlanner the camera set up can be done in "Initial setup"
-page "Optional hardware/Camera gimbal/Shutter" section. Select the channel your
-shutter is connected to and set other parameters depending on your shutter
-control hardware.
+@note __Camera series by distance on ArduCopter prior version 3.6__<br>
+When mission includes a camera series by distance action and mission flight is interrupted by issuing any command that interferes with mission (eg. Hold, Click&Go, RTH) during active camera series then
+triggering will go on until "Continue" command is issued and vehicle reaches the next waypoint without camera trigger action.
+This is because of Ardupilot limitation which does not allow to stop camera triggering via standalone command.
 
 @section altitude Altitude
 
@@ -134,6 +124,8 @@ Vehicle behavior after returning at Home Location depends on on the configuratio
 - RTL_ALT_FINAL == 0: Vehicle will land automatically
 - RTL_ALT_FINAL > 0: Vehicle will descend to given altitude (in centimeters) and hover there waiting for user control.
 
+The RTL_ALT_FINAL can be overridden in config file. See @ref rtl_alt_final. 
+
 @note RTL_ALT_FINAL parameter can be set using MissionPlanner software.
 
 
@@ -148,12 +140,41 @@ MANUALMODE     |  Yes     | Sets _Manual_ mode. It's @b LOITER for multicopter f
 CLICK & GO     |  Yes     | Sets _Click & Go_ (single waypoint) mode. |
 JOYSTICK       |  Yes     | Sets _Joystick mode_. See also @ref joystick below. |
 HOLD           |  Yes     | Pause mission execution. The drone will loiter at its current position. |
-CONTINUE       |  Yes     | Continue with mission execution from next waypoint. Works from _Manual_, Joystick_ and _Click&Go_ modes.|
+CONTINUE       |  Yes     | Continue with mission execution from next waypoint. Works from _Manual_, _Joystick_ and _Click&Go_ modes. If mission is already completed then vehicle will restart the mission.|
 RETURN HOME    |  Yes     | Vehicle will return to home location. See also @ref home_location. |
 TAKEOFF        |  No      | |
 LAND           |  Yes     | |
 EMERGENCYLAND  |  No      | |
-CAMERA_TRIGGER |  No      | |
+CAMERA_TRIGGER |  Yes     | See @ref camera_trigger for details|
+
+@section camera_trigger Camera trigger command
+
+There are two (mutually exclusive) ways to trigger camera on Ardupilot.
+
+1) By default camera triggering done via DO_DIGICAM_CONTROL command.<br>
+This allows trigger by distance (typically used in aerial photo missions) and single shot. Trigger by time WP action is not possible with this command.<br>
+Camera interface must be configured via MissionPlanner or via "vehicle.ardupilot.parameter" settings before this command can be used.
+It is assumed that the vehicle is configured in "servo" mode (not "relay") for camera triggering.<br>
+Make sure that SERVO*_FUNCTION is set to 10 (camera trigger).
+Please refer to Ardupilot manual for details at http://ardupilot.org/copter/docs/common-camera-shutter-with-servo.html#shutter-configuration-with-pixhawk.
+
+2) If camera trigger by time in mission is required then it should be specially configured via vehicle.ardupilot.camera_servo_idx parameter in vsm-ardupilot.conf.<br>
+For configuration parameters see @ref camera_control_params.<br>
+In this case camera is triggered via DO_REPEAT_SERVO command.
+This allows trigger by time and single shot. Trigger by distance WP action is not possible with this command.<br>
+When camera trigger command is issued then the specified servo is moved to the value specified by
+camera_servo_pwm and held there for the half of the specified interval. The servo then moves back to
+the value specified by the corresponding RC<camera_servo_idx>_TRIM parameter.
+Make sure that SERVO<camera_servo_idx>_FUNCTION is set to 0 (servo controlled by mission).
+Both parameters RC_TRIM and SERVO_FUNCTION should be configured via MissionPlanner or via "vehicle.ardupilot.parameter" settings.
+
+3) Usage of both camera trigger actions "by time" and "by distance" in the same mission is not supported.
+
+@section adsb_rx ADSB receiver support
+
+Ardupilot supports connection with <a href="http://www.uavionix.com/products/pingrx">PingRX ADS-B receiver</a> from uAvionix.
+Please refer to <a href="http://ardupilot.org/copter/docs/common-ads-b-receiver.html">Ardupilot docs</a> for details on hardware setup.
+UgCS will receive the ADSB messages from autopilot and show detected vehicles in client GUI.
 
 @section joystick Joystick support
 
@@ -314,24 +335,25 @@ be visible to the UgCS.
 
 @subsection camera_control_params Camera control parameters
 
-Mandatory. Read Ardupilot manual about camera triggering configuration to
-understand these parameters. It is assumed that the vehicle is configured
-in "servo" mode (not "relay") for camera triggering.
+Camera trigger parameters. See also @ref camera_trigger.
 
 - @b Name: vehicle.ardupilot.camera_servo_idx
+- @b Default: None. camera trigger is controlled via DO_DIGICAM_CONTROL command.
 - @b Description: Index of the servo to use for camera triggering.
-- @b Example:
+- @b Example (Use 8th servo output as camera trigger):
 
          vehicle.ardupilot.camera_servo_idx = 8
          
 - @b Name: vehicle.ardupilot.camera_servo_pwm
+- @b Default: Value from CAM_SERVO_ON parameter.
 - @b Description: PWM value to set for camera triggering servo when taking photo.
 - @b Example:
 
          vehicle.ardupilot.camera_servo_pwm = 1900
          
 - @b Name: vehicle.ardupilot.camera_servo_time
-- @b Description:  Time to hold camera servo at the specified PWM when triggering single photo in seconds.
+- @b Default: Value from CAM_DURATION parameter.
+- @b Description:  Time to hold camera servo at the specified PWM when triggering single photo in seconds. After that time servo will return to the RC<camera_servo_idx>_TRIM value. This value is used only in single shot command. WP action camera_trigger_by_time provides its own interval.
 - @b Example:
 
          vehicle.ardupilot.camera_servo_time = 1.0
@@ -374,6 +396,31 @@ Rate of 1 produces ~350 bytes/sec of telemetry traffic.
 
         vehicle.ardupilot.telemetry_rate = 1
 
+@subsection ignore_speed Ignore route speed settings
+
+Use this to disable all speed changes defined in route. Vehicle will fly with default speed the whole route.   
+
+- @b Required: No.
+- @b Supported @b values: yes, no
+- @b Default: no
+- @b Example:
+
+        vehicle.ardupilot.ignore_speed_in_route = yes
+
+@subsection mavlink_injection Mavlink message injection
+
+Ardupilot VSM can receive mavlink packets and forward them to the vehicle if vehicle with specified target_id is connected. It can be used to send GPS RTK corrections to vehicles.
+If message has no target_id or traget_id is 0 then it is sent to all connected vehicles.
+Supported messages are: COMMAND_LONG, COMMAND_INT, GPS_INJECT_DATA and GPS_RTCM_DATA. 
+The prefix mavlink_injection supports all the same syntax as "connection" prefix.
+
+- @b Required: No.
+- @b Supported @b values: Same as those for connection prefix.
+- @b Default: Not set.
+- @b Example:
+
+        mavlink_injection.udp_any.1.local_port = 44444
+
 @subsection disarm_delay DISARM_DELAY parameter
 
 - @b Required: No.
@@ -383,4 +430,17 @@ Rate of 1 produces ~350 bytes/sec of telemetry traffic.
 - @b Example:
 
         vehicle.ardupilot.parameter.DISARM_DELAY = 5
+
+@subsection rtl_alt_final RTL_ALT_FINAL parameter
+
+- @b Required: No.
+- @b Supported @b values: Any positive integer
+- @b Default: Do not set
+- @b Unit: centimeter
+- @b Description: Set the final altitude in cm the vehicle will hover at after "Return To Home". 
+Vehicle will land if set to 0.
+- @b Example: Hover at 5m altitude after RTH.
+
+        vehicle.ardupilot.parameter.RTL_ALT_FINAL = 500
+
 */

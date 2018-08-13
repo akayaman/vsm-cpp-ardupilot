@@ -1,10 +1,12 @@
-// Copyright (c) 2017, Smart Projects Holdings Ltd
+// Copyright (c) 2018, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
 #include <ardupilot_vehicle.h>
 
-const ugcs::vsm::Mavlink_demuxer::System_id Mavlink_vehicle::VSM_SYSTEM_ID = 1;
+using namespace ugcs::vsm;
+
+const Mavlink_demuxer::System_id Mavlink_vehicle::VSM_SYSTEM_ID = 1;
 
 /* Reference Mavlink implementation (ArduPilot) source code
  * (as for 17-July-2013) has the following comment:
@@ -18,12 +20,11 @@ const ugcs::vsm::Mavlink_demuxer::System_id Mavlink_vehicle::VSM_SYSTEM_ID = 1;
  *  has component ID of 1, which is a hard-coded value. Thats why here
  *  same default component ID is used for all operations.
  */
-const ugcs::vsm::Mavlink_demuxer::Component_id Mavlink_vehicle::VSM_COMPONENT_ID = 1;
+const Mavlink_demuxer::Component_id Mavlink_vehicle::VSM_COMPONENT_ID = 1;
 constexpr std::chrono::milliseconds Ardupilot_vehicle::RC_OVERRIDE_PERIOD;
 constexpr std::chrono::milliseconds Ardupilot_vehicle::RC_OVERRIDE_TIMEOUT;
 constexpr std::chrono::seconds Ardupilot_vehicle::HL_POLLING_PERIOD;
-
-using namespace ugcs::vsm;
+constexpr std::chrono::seconds Ardupilot_vehicle::ADSB_VEHICLE_TIMEOUT;
 
 void
 Ardupilot_vehicle::On_enable()
@@ -33,6 +34,10 @@ Ardupilot_vehicle::On_enable()
     read_version.version_handler = Read_version::Make_version_handler(
         &Ardupilot_vehicle::On_autopilot_version,
         Shared_from_this());
+    read_version.Set_next_action(
+        Read_version::Make_next_action(
+                &Ardupilot_vehicle::On_version_processed,
+                this));
 
     // We need to understand only that FS_EKF_ACTION is supported.
     read_version.Enable();
@@ -46,12 +51,24 @@ Ardupilot_vehicle::On_enable()
             &Ardupilot_vehicle::On_mission_downloaded,
             this));
 
+    mission_upload.item_handler = Mission_upload::Make_mission_request_handler(
+        &Ardupilot_vehicle::On_mission_request,
+        Shared_from_this());
+
     // Poll for home location until it becomes valid.
     home_location_timer =
         Timer_processor::Get_instance()->Create_timer(
             HL_POLLING_PERIOD,
             Make_callback(
                 &Ardupilot_vehicle::On_home_location_timer,
+                Shared_from_this()),
+            Get_completion_ctx());
+
+    adsb_vehicles_timer =
+        Timer_processor::Get_instance()->Create_timer(
+            std::chrono::seconds(1),
+            Make_callback(
+                &Ardupilot_vehicle::On_adsb_vehicles_timer,
                 Shared_from_this()),
             Get_completion_ctx());
 
@@ -68,6 +85,11 @@ Ardupilot_vehicle::On_enable()
             Shared_from_this()),
         real_system_id);
 
+    mav_stream->Get_demuxer().Register_handler<mavlink::MESSAGE_ID::ADSB_VEHICLE, mavlink::Extension>(
+        Mavlink_demuxer::Make_handler<mavlink::MESSAGE_ID::ADSB_VEHICLE, mavlink::Extension>(
+                &Ardupilot_vehicle::On_adsb_vehicle,
+                Shared_from_this()),
+        real_system_id);
 
     mav_stream->Get_demuxer().Register_handler<mavlink::sph::SPH_ADSB_TRANSPONDER_STATE, mavlink::sph::Extension>(
         Mavlink_demuxer::Make_handler<mavlink::sph::SPH_ADSB_TRANSPONDER_STATE, mavlink::sph::Extension>(
@@ -77,55 +99,67 @@ Ardupilot_vehicle::On_enable()
 
     Download_mission();
 
-    subsystems.adsb_transponder = Add_subdevice(SUBDEVICE_TYPE_ADSB_TRANSPONDER);
+    adsb_transponder = Add_subsystem(proto::SUBSYSTEM_TYPE_ADSB_TRANSPONDER);
 
-    c_adsb_set_mode = Add_command(subsystems.adsb_transponder, "adsb_set_mode", true, false);
-    auto  p = c_adsb_set_mode->Add_parameter("mode", ugcs::vsm::proto::FIELD_SEMANTIC_ADSB_MODE);
-    p->Add_enum("off", ugcs::vsm::proto::ADSB_MODE_OFF);
-    p->Add_enum("on", ugcs::vsm::proto::ADSB_MODE_ON);
-    p->Add_enum("stby", ugcs::vsm::proto::ADSB_MODE_STBY);
-    p->Add_enum("alt", ugcs::vsm::proto::ADSB_MODE_ALT);
+    c_adsb_set_mode = adsb_transponder->Add_command("adsb_set_mode", false);
+    auto  p = c_adsb_set_mode->Add_parameter("mode", proto::FIELD_SEMANTIC_ADSB_MODE);
+    p->Add_enum("off", proto::ADSB_MODE_OFF);
+    p->Add_enum("on", proto::ADSB_MODE_ON);
+    p->Add_enum("stby", proto::ADSB_MODE_STBY);
+    p->Add_enum("alt", proto::ADSB_MODE_ALT);
 
-    c_adsb_set_parameter = Add_command(subsystems.adsb_transponder, "set_parameter", true, false);
+    c_adsb_set_parameter = adsb_transponder->Add_command("set_parameter", false);
     c_adsb_set_parameter->Add_parameter("adsb_icao", Property::VALUE_TYPE_INT);
     c_adsb_set_parameter->Add_parameter("adsb_squawk", proto::FIELD_SEMANTIC_SQUAWK);
     c_adsb_set_parameter->Add_parameter("adsb_registration", proto::FIELD_SEMANTIC_STRING);
     c_adsb_set_parameter->Add_parameter("adsb_flight_id", proto::FIELD_SEMANTIC_STRING);
 
-    c_adsb_set_ident = Add_command(subsystems.adsb_transponder, "adsb_set_ident", true, false);
+    c_adsb_set_ident = adsb_transponder->Add_command("adsb_set_ident", false);
 
     c_set_fence->Set_available(true);
     c_set_fence->Set_enabled(true);
 
+    if (Is_copter()) {
+        c_set_heading->Set_available(true);
+        c_set_relative_heading->Set_available(true);
+    }
+
+    c_takeoff_command->Set_available(true);
+
     c_trigger_calibration->Set_available(true);
     c_trigger_reboot->Set_available(true);
 
-    c_transition_fixed = Add_command(subsystems.fc, "transition_fixed", false, true);
-    c_transition_vtol = Add_command(subsystems.fc, "transition_vtol", false, true);
+    c_write_parameter->Set_available();
+    c_write_parameter->Set_enabled();
 
-#define ADD_T(x, y) t_##x = Add_telemetry(subsystems.adsb_transponder, #x, y)
-    ADD_T(adsb_altitude_internal, ugcs::vsm::proto::FIELD_SEMANTIC_BOOL);
-    ADD_T(adsb_icao, ugcs::vsm::proto::FIELD_SEMANTIC_ICAO);
-    ADD_T(adsb_registration, ugcs::vsm::proto::FIELD_SEMANTIC_STRING);
-    ADD_T(adsb_flight, ugcs::vsm::proto::FIELD_SEMANTIC_STRING);
+    c_transition_fixed = flight_controller->Add_command("transition_fixed", true);
+    c_transition_vtol = flight_controller->Add_command("transition_vtol", true);
+    c_wait_until = flight_controller->Add_command("wait_until", true);
+    c_wait_until->Add_parameter("time", proto::FIELD_SEMANTIC_TIMESTAMP);
+
+#define ADD_T(x, y) t_##x = adsb_transponder->Add_telemetry(#x, y)
+    ADD_T(adsb_altitude_internal, proto::FIELD_SEMANTIC_BOOL);
+    ADD_T(adsb_icao, proto::FIELD_SEMANTIC_ICAO);
+    ADD_T(adsb_registration, proto::FIELD_SEMANTIC_STRING);
+    ADD_T(adsb_flight, proto::FIELD_SEMANTIC_STRING);
 #undef ADD_T
 
-#define ADD_T(x, y, z) t_##x = Add_telemetry(subsystems.adsb_transponder, #x, y, z)
+#define ADD_T(x, y, z) t_##x = adsb_transponder->Add_telemetry(#x, y, z)
     // Set timeout for telemetry fields so they automatically
     // are set to N/A if no new data received for 5 seconds.
-    ADD_T(adsb_altitude, ugcs::vsm::proto::FIELD_SEMANTIC_ALTITUDE_AMSL, 5);
-    ADD_T(adsb_ident_active, ugcs::vsm::proto::FIELD_SEMANTIC_BOOL, 5);
-    ADD_T(adsb_squawk, ugcs::vsm::proto::FIELD_SEMANTIC_SQUAWK, 5);
-    ADD_T(adsb_transponder_mode, ugcs::vsm::proto::FIELD_SEMANTIC_ADSB_MODE, 5);
-    t_adsb_transponder_mode->Add_enum("off", ugcs::vsm::proto::ADSB_MODE_OFF);
-    t_adsb_transponder_mode->Add_enum("on", ugcs::vsm::proto::ADSB_MODE_ON);
-    t_adsb_transponder_mode->Add_enum("stby", ugcs::vsm::proto::ADSB_MODE_STBY);
-    t_adsb_transponder_mode->Add_enum("alt", ugcs::vsm::proto::ADSB_MODE_ALT);
-    ADD_T(adsb_error_xpdr, ugcs::vsm::proto::FIELD_SEMANTIC_BOOL, 5);
-    ADD_T(adsb_error_icao, ugcs::vsm::proto::FIELD_SEMANTIC_BOOL, 5);
-    ADD_T(adsb_error_gps, ugcs::vsm::proto::FIELD_SEMANTIC_BOOL, 5);
-    ADD_T(adsb_error_squitter, ugcs::vsm::proto::FIELD_SEMANTIC_BOOL, 5);
-    ADD_T(adsb_error_temperature, ugcs::vsm::proto::FIELD_SEMANTIC_BOOL, 5);
+    ADD_T(adsb_altitude, proto::FIELD_SEMANTIC_ALTITUDE_AMSL, 5);
+    ADD_T(adsb_ident_active, proto::FIELD_SEMANTIC_BOOL, 5);
+    ADD_T(adsb_squawk, proto::FIELD_SEMANTIC_SQUAWK, 5);
+    ADD_T(adsb_transponder_mode, proto::FIELD_SEMANTIC_ADSB_MODE, 5);
+    t_adsb_transponder_mode->Add_enum("off", proto::ADSB_MODE_OFF);
+    t_adsb_transponder_mode->Add_enum("on", proto::ADSB_MODE_ON);
+    t_adsb_transponder_mode->Add_enum("stby", proto::ADSB_MODE_STBY);
+    t_adsb_transponder_mode->Add_enum("alt", proto::ADSB_MODE_ALT);
+    ADD_T(adsb_error_xpdr, proto::FIELD_SEMANTIC_BOOL, 5);
+    ADD_T(adsb_error_icao, proto::FIELD_SEMANTIC_BOOL, 5);
+    ADD_T(adsb_error_gps, proto::FIELD_SEMANTIC_BOOL, 5);
+    ADD_T(adsb_error_squitter, proto::FIELD_SEMANTIC_BOOL, 5);
+    ADD_T(adsb_error_temperature, proto::FIELD_SEMANTIC_BOOL, 5);
 #undef ADD_T
 
     adsb_parameter_map.insert({"ADSB_ICAO_ID", t_adsb_icao});
@@ -134,8 +168,8 @@ Ardupilot_vehicle::On_enable()
     adsb_string_parameter_map.insert({"ADSB_FLIGHT", t_adsb_flight});
     adsb_string_parameter_map.insert({"ADSB_TAIL", t_adsb_registration});
 
-    if (type == ugcs::vsm::mavlink::MAV_TYPE_FIXED_WING) {
-        c_set_parameter = Add_command(subsystems.fc, "set_parameter", false, true);
+    if (Is_vehicle_type(proto::VEHICLE_TYPE_FIXED_WING)) {
+        c_set_parameter = flight_controller->Add_command("set_parameter", true);
         c_set_parameter->Add_parameter("landing_flare_altitude", Property::VALUE_TYPE_FLOAT);
         c_set_parameter->Add_parameter("landing_flare_time", Property::VALUE_TYPE_FLOAT);
         c_set_parameter->Add_parameter("min_landing_pitch", Property::VALUE_TYPE_FLOAT);
@@ -172,8 +206,12 @@ Ardupilot_vehicle::On_enable()
         proto::FAILSAFE_ACTION_CONTINUE
         });
 
+    Set_rth_actions({
+        proto::RTH_ACTION_WAIT,
+        proto::RTH_ACTION_LAND
+    });
+
     Set_parameters_from_properties("vehicle.ardupilot.parameter");
-    read_parameters.Enable({"FENCE_ENABLE", "Q_ENABLE"});
 }
 
 bool
@@ -184,6 +222,16 @@ Ardupilot_vehicle::Verify_parameter(const std::string& name, float value, mavlin
             type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
             return true;
         } else {
+            return false;
+        }
+    }
+    if (name == "RTL_ALT_FINAL") {
+        if (!Is_copter()) {
+            // Parameter supported by copters only.
+            return false;
+        }
+        if (value < 0) {
+            // Must be positive.
             return false;
         }
     }
@@ -198,9 +246,9 @@ Ardupilot_vehicle::Verify_parameter(const std::string& name, float value, mavlin
 
 void
 Ardupilot_vehicle::On_adsb_state(
-    ugcs::vsm::mavlink::Message<
-        ugcs::vsm::mavlink::sph::SPH_ADSB_TRANSPONDER_STATE,
-        ugcs::vsm::mavlink::sph::Extension>::Ptr message)
+    mavlink::Message<
+        mavlink::sph::SPH_ADSB_TRANSPONDER_STATE,
+        mavlink::sph::Extension>::Ptr message)
 {
     if (!adsb_transponder_type) {
         adsb_transponder_type = message->payload->type.Get();
@@ -286,7 +334,7 @@ void
 Ardupilot_vehicle::Handle_ucs_command(
     Ucs_request::Ptr ucs_request)
 {
-    if (vehicle_command.vehicle_command_request || vehicle_command.ucs_request) {
+    if (vehicle_command.ucs_request) {
         Command_failed(ucs_request, "Previous request in progress");
         return;
     }
@@ -299,20 +347,19 @@ Ardupilot_vehicle::Handle_ucs_command(
     for (int c = 0; c < ucs_request->request.device_commands_size(); c++) {
         auto &vsm_cmd = ucs_request->request.device_commands(c);
 
+        VEHICLE_LOG_INF((*this), "COMMAND %s", Dump_command(vsm_cmd).c_str());
+
         auto cmd = Get_command(vsm_cmd.command_id());
 
-        if (    cmd != c_adsb_set_mode
-            &&  cmd != c_adsb_set_parameter
-            &&  cmd != c_adsb_set_ident
-            &&  cmd != c_set_servo
-            &&  cmd != c_set_fence
-            &&  cmd != c_emergency_land
-            &&  cmd != c_trigger_calibration
-            &&  cmd != c_trigger_reboot
-            &&  cmd != c_repeat_servo) {
-            // Delegate it back to base class handler (old style).
+        if (cmd == c_mission_upload) {
             if (c == 0) {
-                Vehicle::Handle_ucs_command(ucs_request);
+                if (read_waypoints.In_progress()) {
+                    Command_failed(ucs_request, "Mission download in progress");
+                    return;
+                }
+                task_upload.Disable("Internal error");
+                task_upload.ucs_request = ucs_request;
+                task_upload.Enable();
             } else {
                 Command_failed(ucs_request, "Unsupported command", proto::STATUS_INVALID_COMMAND);
             }
@@ -328,9 +375,14 @@ Ardupilot_vehicle::Handle_ucs_command(
 void
 Ardupilot_vehicle::On_disable()
 {
+    for (auto it = adsb_vehicles.begin(); it != adsb_vehicles.end();) {
+		it->second->Unregister();
+		it = adsb_vehicles.erase(it);
+    }
     vehicle_command.Disable("Vehicle disconnected");
-    task_upload.Disable();
+    task_upload.Disable("Vehicle disconnected");
     home_location_timer->Cancel();
+    adsb_vehicles_timer->Cancel();
     if (rc_override_timer) {
         rc_override_timer->Cancel();
     }
@@ -338,23 +390,58 @@ Ardupilot_vehicle::On_disable()
 }
 
 void
-Ardupilot_vehicle::On_autopilot_version(ugcs::vsm::mavlink::Pld_autopilot_version ver)
+Ardupilot_vehicle::On_autopilot_version(mavlink::Pld_autopilot_version ver)
 {
-    int maj = (ver->flight_sw_version.Get() >> 24) & 0xff;
-    int min = (ver->flight_sw_version.Get() >> 16) & 0xff;
-    int patch = (ver->flight_sw_version.Get() >> 8) & 0xff;
-    int type = (ver->flight_sw_version.Get() >> 0) & 0xff;
+    ardupilot_version = ver->flight_sw_version.Get();
+    int maj = (ardupilot_version >> 24) & 0xff;
+    int min = (ardupilot_version >> 16) & 0xff;
+    int patch = (ardupilot_version >> 8) & 0xff;
+    int type = (ardupilot_version >> 0) & 0xff;
     VEHICLE_LOG_INF(*this, "Ardupilot version=%d.%d.%d, type=%d", maj, min, patch, type);
 
-    if (ver->flight_sw_version.Get() >= ARDUPILOT_VERSION(3, 3, 1)) {
+    if (!Is_version_less_than(3, 3, 1)) {
         use_ekf_action_as_gps_failsafe = true;
         send_home_position_as_mav_cmd = true;
+        auto_generate_mission_poi = false;
     }
 
-    if (ver->flight_sw_version.Get() >= ARDUPILOT_VERSION(3, 4, 0)) {
+    std::unordered_set<std::string> names = {"FENCE_ENABLE"};
+
+    if (!Is_version_less_than(3, 4, 0)) {
         gnd_alt_offset_allow = true;
+        if (set_ground_alt_offset) {
+            names.emplace("GND_ALT_OFFSET");
+        }
     }
 
+    if (!Is_version_less_than(3, 7, 0) &&
+        Is_vehicle_type(proto::VEHICLE_TYPE_FIXED_WING))
+    {
+        // Detect if this is VTOL plane.
+        names.emplace("Q_ENABLE");
+    } else {
+        if (!Is_registered()) {
+            Register();
+        }
+    }
+
+    if (!Is_version_less_than(3, 6, 0)) {
+        use_batt_fs_as_batt_failsafe = true;
+        do_set_cam_trig_dist_as_command = true;
+    }
+
+    if (camera_servo_idx != -1) {
+        names.emplace("SERVO" + std::to_string(camera_servo_idx) + "_FUNCTION");
+        if (camera_servo_time == -1) {
+            names.emplace("CAM_DURATION");
+        }
+
+        if (camera_servo_pwm == -1) {
+            names.emplace("CAM_SERVO_ON");
+        }
+    }
+
+    read_parameters.Enable(std::move(names));
 
     /* Disable HOME_POSITION support because SITL does not report it if connected via UDP.
      * With TCP it does work fine, but UDP scenario is very important for testing.
@@ -372,8 +459,18 @@ Ardupilot_vehicle::On_autopilot_version(ugcs::vsm::mavlink::Pld_autopilot_versio
 }
 
 void
+Ardupilot_vehicle::On_version_processed(bool success, std::string)
+{
+    // Support for ardupilot < 3.2.
+    if (!success && !Is_registered()) {
+        // If there is no answer to AUTOPILOT_VERSION_REQUEST register as is.
+        Register();
+    }
+}
+
+void
 Ardupilot_vehicle::On_parameter(
-    ugcs::vsm::mavlink::Message<mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr m)
+    mavlink::Message<mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr m)
 {
     const auto &name = m->payload->param_id.Get_string();
     auto i = adsb_parameter_map.find(name);
@@ -384,10 +481,28 @@ Ardupilot_vehicle::On_parameter(
         current_alt_offset = m->payload->param_value.Get();
     } else if (name == "FENCE_ENABLE") {
         t_fence_enabled->Set_value(m->payload->param_value.Get() != 0);
+    } else if (name == "CAM_SERVO_ON") {
+        camera_servo_pwm = m->payload->param_value.Get();
+    } else if (name == "CAM_DURATION") {
+        // CAM_DURATION is in deciseconds.
+        camera_servo_time  = m->payload->param_value.Get() / 10;
     } else if (name == "Q_ENABLE") {
-        vtol_plane = (m->payload->param_value.Get() != 0);
-        VEHICLE_LOG_INF(*this, "This is a VTOL vehicle");
-        Add_status_message("This is a VTOL capable vehicle, takeoff and land commands will be translated to VTOL versions");
+        if (m->payload->param_value.Get() != 0) {
+            Set_vehicle_type(proto::VEHICLE_TYPE_VTOL);
+        }
+        if (!Is_registered()) {
+            Register();
+        }
+    } else if (camera_servo_idx != -1
+                && (name == std::string("SERVO") + std::to_string(camera_servo_idx) + "_FUNCTION")){
+        int func = m->payload->param_value.Get();
+        if (func != 0) {
+            VEHICLE_LOG_ERR(
+                *this,
+                "camera_servo_idx specified but the corresponding function is set to %d. "
+                "Camera triggering will not work.",
+                func);
+        }
     }
     Commit_to_ucs();
 }
@@ -403,6 +518,24 @@ Ardupilot_vehicle::On_string_parameter(
         i->second->Set_value(message->payload->param_value.Get_string());
         Commit_to_ucs();
     }
+}
+
+void
+Ardupilot_vehicle::On_adsb_vehicle(
+        ugcs::vsm::mavlink::Message<mavlink::MESSAGE_ID::ADSB_VEHICLE>::Ptr message)
+{
+    auto icao = message->payload->ICAO_address.Get();
+    auto ret = adsb_vehicles.emplace(icao, nullptr);
+    auto &vehicle = ret.first->second;
+    if (ret.second) {
+        // Create vehicle if there is not one with this ICAO already.
+        vehicle = Adsb_aircraft::Create(icao);
+        // Tell server that ADSB receiver has discovered new aircraft.
+        vehicle->Register();
+        LOG("New ADSB aircraft %06X registered", icao);
+    }
+    // Send telemetry data for this vehicle.
+    vehicle->On_message(message);
 }
 
 void
@@ -427,12 +560,23 @@ Ardupilot_vehicle::On_mission_item(ugcs::vsm::mavlink::Pld_mission_item mi)
             mi->param4.Get(),
             mi->x.Get(), mi->y.Get(), mi->z.Get());
     }
+    if (task_upload.ucs_request) {
+        task_upload.On_download_progress(mi->seq);
+    }
     current_route.Add_item(mi);
 }
 
 void
+Ardupilot_vehicle::On_mission_request(int seq)
+{
+    if (task_upload.ucs_request) {
+        task_upload.On_upload_progress(seq);
+    }
+}
+
+void
 Ardupilot_vehicle::On_home_position(
-    ugcs::vsm::mavlink::Message<mavlink::MESSAGE_ID::HOME_POSITION>::Ptr hp)
+    mavlink::Message<mavlink::MESSAGE_ID::HOME_POSITION>::Ptr hp)
 {
     double lat = hp->payload->latitude.Get();
     double lon = hp->payload->longitude.Get();
@@ -489,72 +633,22 @@ Ardupilot_vehicle::On_home_location_timer()
     return false;
 }
 
-void
-Ardupilot_vehicle::Handle_vehicle_request(Vehicle_task_request::Handle request)
+bool
+Ardupilot_vehicle::On_adsb_vehicles_timer()
 {
-    if (read_waypoints.In_progress()) {
-        request.Fail("Mission download in progress");
-        return;
-    }
-    VEHICLE_LOG_INF((*this), "Starting to handle %zu tasks...", request->actions.size());
-    ASSERT(!task_upload.request);
-    task_upload.Disable();
-    task_upload.Enable(request);
-}
-
-void
-Ardupilot_vehicle::Handle_vehicle_request(Vehicle_command_request::Handle request)
-{
-    if (vehicle_command.vehicle_command_request || vehicle_command.ucs_request) {
-        request.Fail("Previous request in progress");
-    } else {
-        vehicle_command.Disable("Internal error");
-        vehicle_command.vehicle_command_request = request;
-        vehicle_command.Enable();
-    }
-}
-
-Ardupilot_vehicle::Type
-Ardupilot_vehicle::Get_type() const
-{
-    return Get_type(Get_mav_type());
-}
-
-Ardupilot_vehicle::Type
-Ardupilot_vehicle::Get_type(ugcs::vsm::mavlink::MAV_TYPE type)
-{
-    switch (type) {
-    case mavlink::MAV_TYPE::MAV_TYPE_QUADROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_HEXAROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_OCTOROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_TRICOPTER:
-    case mavlink::MAV_TYPE::MAV_TYPE_HELICOPTER:
-    case mavlink::MAV_TYPE::MAV_TYPE_COAXIAL:
-        return Type::COPTER;
-        break;
-    // VTOL is a kind of plane in ardupilot world.
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_DUOROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_QUADROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_RESERVED2:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_RESERVED3:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_RESERVED4:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_RESERVED5:
-    case mavlink::MAV_TYPE::MAV_TYPE_VTOL_TILTROTOR:
-    case mavlink::MAV_TYPE::MAV_TYPE_FIXED_WING:
-        return Type::PLANE;
-        break;
-    case mavlink::MAV_TYPE::MAV_TYPE_GROUND_ROVER:
-        return Type::ROVER;
-        break;
-    default:
-        switch (static_cast<mavlink::ugcs::MAV_TYPE>(type)) {
-            case mavlink::ugcs::MAV_TYPE::MAV_TYPE_IRIS:
-                return Type::COPTER;
-            default:
-                break;
+    for (auto it = adsb_vehicles.begin(); it != adsb_vehicles.end();) {
+        if (it->second->Time_since_last_update() > ADSB_VEHICLE_TIMEOUT) {
+            LOG("ADSB aircraft %06X timeouted", it->first);
+            it->second->Unregister();
+            it = adsb_vehicles.erase(it);
+        } else {
+            it++;
         }
-        return Type::OTHER;
     }
+    if (Get_completion_ctx()->Is_enabled()) {
+        return true;
+    }
+    return false;
 }
 
 bool
@@ -567,6 +661,7 @@ Ardupilot_vehicle::Vehicle_command_act::Try()
     }
 
     if (cmd_messages.size()) {
+      
         Send_message(*(cmd_messages.front()));
 
         auto cmd = cmd_messages.front();
@@ -594,7 +689,7 @@ Ardupilot_vehicle::Vehicle_command_act::Try_verify_polyfence()
             auto& payload = (*std::static_pointer_cast<mavlink::apm::Pld_fence_point>(cmd));
             int idx = payload->idx.Get();
             VEHICLE_LOG_DBG(vehicle, "Verify geofence for point %d", idx);
-            ugcs::vsm::mavlink::apm::Pld_fence_fetch_point fetch_point;
+            mavlink::apm::Pld_fence_fetch_point fetch_point;
             Fill_target_ids(fetch_point);
             fetch_point->idx = idx;
             Send_message(fetch_point);
@@ -615,7 +710,7 @@ Ardupilot_vehicle::Vehicle_command_act::Try_verify_polyfence()
 
 void
 Ardupilot_vehicle::Vehicle_command_act::On_point_value(
-        mavlink::Message<mavlink::apm::MESSAGE_ID::FENCE_POINT, ugcs::vsm::mavlink::apm::Extension>::Ptr message)
+        mavlink::Message<mavlink::apm::MESSAGE_ID::FENCE_POINT, mavlink::apm::Extension>::Ptr message)
 {
     auto cmd = cmd_messages.front();
     if (cmd->Get_id() != mavlink::apm::MESSAGE_ID::FENCE_POINT) {
@@ -665,7 +760,6 @@ Ardupilot_vehicle::Vehicle_command_act::On_point_value(
 
     Send_next_command();
 }
-
 
 void
 Ardupilot_vehicle::Start_rc_override()
@@ -772,6 +866,39 @@ Ardupilot_vehicle::Send_rc_override_timer()
 }
 
 void
+Ardupilot_vehicle::Vehicle_command_act::Stop_camera_series()
+{
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    if (ardu_vehicle.camera_servo_idx == -1) {
+        // It is not possible to stop camera_by_distance on ardupilot up until 3.6
+        if (ardu_vehicle.do_set_cam_trig_dist_as_command) {
+            (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_CAM_TRIGG_DIST;
+            (*cmd_long)->param1 = 0;
+        } else {
+            return;
+        }
+    } else {
+        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
+        (*cmd_long)->param1 = ardu_vehicle.camera_servo_idx;
+        (*cmd_long)->param2 = ardu_vehicle.camera_servo_pwm;
+        (*cmd_long)->param3 = 1;
+        (*cmd_long)->param4 = 0;
+    }
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Ardupilot_vehicle::Ardupilot_activity::Disable(const std::string& status)
+{
+    if (ucs_request) {
+        vehicle.Command_failed(ucs_request, status);
+        ucs_request = nullptr;
+    }
+    Activity::Disable();
+}
+
+void
 Ardupilot_vehicle::Vehicle_command_act::Send_next_command()
 {
     cmd_messages.pop_front();
@@ -779,13 +906,15 @@ Ardupilot_vehicle::Vehicle_command_act::Send_next_command()
         // send next command in chain.
         remaining_attempts = try_count;
 
+        vehicle.Report_progress(ucs_request, (command_count - cmd_messages.size()) / command_count);
+
         auto cmd = cmd_messages.front();
         if (cmd->Get_id() == mavlink::apm::MESSAGE_ID::FENCE_POINT) {
             // check if fence already set equal to this point
             auto& payload = (*std::static_pointer_cast<mavlink::apm::Pld_fence_point>(cmd));
             int idx = payload->idx.Get();
             VEHICLE_LOG_DBG(vehicle, "Check current geofence value for point %d", idx);
-            ugcs::vsm::mavlink::apm::Pld_fence_fetch_point fetch_point;
+            mavlink::apm::Pld_fence_fetch_point fetch_point;
             Fill_target_ids(fetch_point);
             fetch_point->idx = idx;
             Send_message(fetch_point);
@@ -879,7 +1008,7 @@ Ardupilot_vehicle::Vehicle_command_act::On_mission_ack(
 
 void
 Ardupilot_vehicle::Vehicle_command_act::On_param_str_value(
-    mavlink::Message<mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE, ugcs::vsm::mavlink::sph::Extension>::Ptr message)
+    mavlink::Message<mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE, mavlink::sph::Extension>::Ptr message)
 {
     VEHICLE_LOG_INF(vehicle, "PARAM_STR_VALUE, %s", message->payload.Dump().c_str());
 
@@ -930,7 +1059,7 @@ Ardupilot_vehicle::Vehicle_command_act::On_param_value(
 
 void
 Ardupilot_vehicle::Vehicle_command_act::On_status_text(
-        ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::STATUSTEXT>::Ptr)
+        mavlink::Message<mavlink::MESSAGE_ID::STATUSTEXT>::Ptr)
 {
     /* Assumed command execution started, so wait longer. */
     if (current_timeout < extended_retry_timeout) {
@@ -945,11 +1074,6 @@ Ardupilot_vehicle::Vehicle_command_act::On_status_text(
 void
 Ardupilot_vehicle::Vehicle_command_act::Enable()
 {
-    if (ardu_vehicle.Get_type() == Type::OTHER) {
-        Disable("Commands for unknown vehicles types are not supported.");
-        return;
-    }
-
     Register_mavlink_handler<mavlink::MESSAGE_ID::COMMAND_ACK>(
         &Vehicle_command_act::On_command_ack,
         this,
@@ -970,7 +1094,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
         this,
         Mavlink_demuxer::COMPONENT_ID_ANY);
 
-    Register_mavlink_handler<mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE, ugcs::vsm::mavlink::sph::Extension>(
+    Register_mavlink_handler<mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE, mavlink::sph::Extension>(
         &Vehicle_command_act::On_param_str_value,
         this,
         Mavlink_demuxer::COMPONENT_ID_ANY);
@@ -983,614 +1107,912 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
     remaining_attempts = try_count;
     current_timeout = retry_timeout;
 
-    /* Create always, it will be assigned to cmd_message, if used. */
-    auto cmd_long = mavlink::Pld_command_long::Create();
-    mavlink::Pld_mission_item::Ptr cmd_mission_item;
-    mavlink::Pld_set_mode::Ptr cmd_set_mode;
-    mavlink::Pld_param_set::Ptr param;
-    Fill_target_ids(*cmd_long);
-    mavlink::apm::Pld_fence_point::Ptr cmd_fence_point;
     cmd_messages.clear();
 
-    if (ucs_request) {
-        for (int c = 0; c < ucs_request->request.device_commands_size(); c++) {
-            auto &vsm_cmd = ucs_request->request.device_commands(c);
+    for (int c = 0; ucs_request && c < ucs_request->request.device_commands_size(); c++) {
+        auto &vsm_cmd = ucs_request->request.device_commands(c);
 
-            auto cmd = vehicle.Get_command(vsm_cmd.command_id());
+        auto cmd = vehicle.Get_command(vsm_cmd.command_id());
 
-            VEHICLE_LOG_INF((vehicle), "COMMAND %s (%d) received",
-                cmd->Get_name().c_str(),
-                vsm_cmd.command_id());
+        Property_list params;
 
-            Property_list params;
-
-            try {
-                params = cmd->Build_parameter_list(vsm_cmd);
-                if        (cmd == vehicle.c_adsb_set_mode) {
-                    int mode;
-                    if (params.Get_value("mode", mode)) {
-                        (*cmd_long)->command = mavlink::sph::MAV_CMD_ADSB_SET_MODE;
-                        switch (mode) {
-                        case ugcs::vsm::proto::ADSB_MODE_OFF:
-                            (*cmd_long)->param1 = mavlink::sph::ADSB_TRANSPONDER_MODE_OFF;
-                            break;
-                        case ugcs::vsm::proto::ADSB_MODE_ON:
-                            (*cmd_long)->param1 = mavlink::sph::ADSB_TRANSPONDER_MODE_ON;
-                            break;
-                        case ugcs::vsm::proto::ADSB_MODE_STBY:
-                            (*cmd_long)->param1 = mavlink::sph::ADSB_TRANSPONDER_MODE_STBY;
-                            break;
-                        case ugcs::vsm::proto::ADSB_MODE_ALT:
-                            (*cmd_long)->param1 = mavlink::sph::ADSB_TRANSPONDER_MODE_ALT;
-                            break;
-                        default:
-                            VSM_EXCEPTION(Invalid_param_exception, "Unsupported mode");
-                        }
-                        cmd_messages.emplace_back(cmd_long);
-                    } else {
-                        VSM_EXCEPTION(Invalid_param_exception, "Unsupported mode");
-                    }
-
-                } else if (cmd == vehicle.c_adsb_set_parameter) {
-                    int int_value;
-                    std::string str_value;
-                    if (params.Get_value("adsb_icao", int_value)) {
-                        param = mavlink::Pld_param_set::Create();
-                        Fill_target_ids(*param);
-                        (*param)->param_id = "ADSB_ICAO_ID";
-                        (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
-                        (*param)->param_value = int_value;
-                        cmd_messages.emplace_back(param);
-                    }
-                    if (params.Get_value("adsb_squawk", int_value)) {
-                        param = mavlink::Pld_param_set::Create();
-                        Fill_target_ids(*param);
-                        (*param)->param_id = "ADSB_SQUAWK";
-                        (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
-                        (*param)->param_value = int_value;
-                        cmd_messages.emplace_back(param);
-                    }
-                    if (params.Get_value("adsb_registration", str_value)) {
-                        auto param = mavlink::sph::Pld_param_str_set::Create();
-                        Fill_target_ids(*param);
-                        (*param)->param_id = "ADSB_TAIL";
-                        (*param)->param_value = str_value;
-                        cmd_messages.emplace_back(param);
-                    }
-                    if (params.Get_value("adsb_flight_id", str_value)) {
-                        auto param = mavlink::sph::Pld_param_str_set::Create();
-                        Fill_target_ids(*param);
-                        (*param)->param_id = "ADSB_FLIGHT";
-                        (*param)->param_value = str_value;
-                        cmd_messages.emplace_back(param);
-                    }
-                } else if (cmd == vehicle.c_adsb_set_ident) {
-                    param = mavlink::Pld_param_set::Create();
-                    Fill_target_ids(*param);
-                    (*param)->param_id = "ADSB_IDENT";
-                    (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
-                    (*param)->param_value = 1;
-                    cmd_messages.emplace_back(param);
-                } else if (cmd == vehicle.c_emergency_land) {
-                    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-                    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
-                    (*cmd_long)->param1 = 0; /* Do disarm. */
-                    (*cmd_long)->param2 = DISARM_MAGIC_VALUE; // do hard disarm (even when copter is airborne)
-                    cmd_messages.emplace_back(cmd_long);
-                } else if (cmd == vehicle.c_set_servo) {
-                    int servo_id;
-                    int pwm;
-                    params.Get_value("servo_id", servo_id);
-                    params.Get_value("pwm", pwm);
-                    (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_SERVO;
-                    (*cmd_long)->param1 = servo_id;
-                    (*cmd_long)->param2 = pwm;
-                    cmd_messages.emplace_back(cmd_long);
-                } else if (cmd == vehicle.c_repeat_servo) {
-                    int servo_id;
-                    int pwm;
-                    int count;
-                    float delay;
-                    params.Get_value("servo_id", servo_id);
-                    params.Get_value("pwm", pwm);
-                    params.Get_value("delay", delay);
-                    params.Get_value("count", count);
-                    (*cmd_long)->command = mavlink::MAV_CMD_DO_REPEAT_SERVO;
-                    (*cmd_long)->param1 = servo_id;
-                    (*cmd_long)->param2 = pwm;
-                    (*cmd_long)->param3 = count;
-                    if (delay < 0.2) {
-                        (*cmd_long)->param4 = 0;
-                    } else {
-                        // Pixhawk does this slower than expected. Add coefficient.
-                        (*cmd_long)->param4 = delay * 2 - 0.4;
-                    }
-                    cmd_messages.emplace_back(cmd_long);
-                } else if (cmd == vehicle.c_set_fence) {
-                    ugcs::vsm::proto::List_value lats, lngs;
-
-                    /* bitmask, fence type
-                       0: no fence
-                       1 bit: altitude fence
-                       2 bit: cicrle fence
-                       3 bit: polygon fence (after ardupilot 3.4). */
-                    int8_t fence_mask = 0;
-
-
-                    bool polygon_data_is_correct = true;
-
-                    if (params.Get_value("latitudes", lats) && params.Get_value("longitudes", lngs)) {
-                        polygon_data_is_correct = false;
-                        fence_mask |= 4;
-                        int poly_size = lats.values_size();
-                        VEHICLE_LOG_INF(vehicle, "Adding polygon fence, Polygon size = %d", poly_size);
-
-                        // check if polygon data is correct
-                        if (!ardu_vehicle.Is_home_position_valid()) {
-                            // Need valid home location
-                            vehicle.Command_failed(ucs_request,
-                                                   "Polygon fence: home location is not valid.",
-                                                   proto::STATUS_INVALID_PARAM);
-                        } else if (poly_size != lngs.values_size()) {
-                            // ERROR: non equal points number
-                            vehicle.Command_failed(ucs_request,
-                                                   "Polygon fence: non equal number of points in lists",
-                                                   proto::STATUS_INVALID_PARAM);
-                        } else if (poly_size < 4) {
-                            // ERROR: too few points
-                            vehicle.Command_failed(ucs_request,
-                                                   "Polygon fence: need at last 4 points for polygon fence",
-                                                   proto::STATUS_INVALID_PARAM);
-                        } else if (poly_size > 84) {
-                            // ERROR: too much points
-                            vehicle.Command_failed(ucs_request,
-                                                   "Polygon fence: need no more than 84 points for polygon fence",
-                                                   proto::STATUS_INVALID_PARAM);
-                        } else if (lats.values(0).double_value() !=  lats.values(poly_size-1).double_value() ||
-                                   lngs.values(0).double_value() !=  lngs.values(poly_size-1).double_value()) {
-                            // ERROR: first point mast be equal to last point in polygon description
-                            vehicle.Command_failed(ucs_request,
-                               "Polygon fence: first point mast be equal to last point in polygon description",
-                               proto::STATUS_INVALID_PARAM);
-                        } else if (Is_Outside_Polygon(ardu_vehicle.home_location.latitude,
-                                                      ardu_vehicle.home_location.longitude,
-                                                      lats, lngs)) {
-                            // ERROR: home location mas be inside polygon
-                            VEHICLE_LOG_INF(vehicle, "HOME LOCATION : %2.20f, %2.20f",
-                                            ardu_vehicle.home_location.latitude,
-                                            ardu_vehicle.home_location.longitude);
-
-                            vehicle.Command_failed(ucs_request,
-                                                   "Polygon fence: Home Location must be inside polygon",
-                                                   proto::STATUS_INVALID_PARAM);
-                        } else {
-                            polygon_data_is_correct = true;
-                            // check if all values are double
-                            for (int i = 0; i < poly_size; i++) {
-                                if (!(lats.values(i).has_double_value() && lngs.values(i).has_double_value())) {
-                                    vehicle.Command_failed(ucs_request,
-                                                           "Polygon fence: incorrect latitude and longitude values",
-                                                           proto::STATUS_INVALID_PARAM);
-                                    polygon_data_is_correct = false;
-                                }
-                            }
-
-                            if (polygon_data_is_correct) {
-                                // set fence size
-                                param = mavlink::Pld_param_set::Create();
-                                Fill_target_ids(*param);
-                                (*param)->param_id = "FENCE_TOTAL";
-                                (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                                // +1 cause fist point we send is returning point.
-                                (*param)->param_value = poly_size + 1;
-                                cmd_messages.emplace_back(param);
-
-                                // zero-point: Virtual return point.
-                                // Virtual - because Copter returns to land point
-                                // and not to this "return point". But "return point" needs to be inside
-                                // polygon anyway due to strange ardupilot logic. So we set return point
-                                // to Home Location and check that it is inside polygon (earlier) with
-                                // function Is_Outside_Polygon.
-                                VEHICLE_LOG_INF(vehicle, "Virtual return point(0) : %2.20f, %2.20f",
-                                                ardu_vehicle.home_location.latitude * 180.0f / M_PI,
-                                                ardu_vehicle.home_location.longitude * 180.0f / M_PI);
-                                cmd_fence_point = mavlink::apm::Pld_fence_point::Create();
-                                Fill_target_ids(*cmd_fence_point);
-                                (*cmd_fence_point)->lat = ardu_vehicle.home_location.latitude * 180.0f / M_PI;
-                                (*cmd_fence_point)->lng = ardu_vehicle.home_location.longitude * 180.0f / M_PI;
-                                (*cmd_fence_point)->count = poly_size;
-                                (*cmd_fence_point)->idx = 0;
-                                cmd_messages.emplace_back(cmd_fence_point);
-
-                                VEHICLE_LOG_INF(vehicle, "POLYGON FENCE POINTS:");
-                                for (int i = 0; i < poly_size; i++) {
-                                    double lat = lats.values(i).double_value()* 180.0f / M_PI;
-                                    double lng = lngs.values(i).double_value()* 180.0f / M_PI;
-                                    VEHICLE_LOG_INF(vehicle, "%d : %2.20f, %2.20f", i, lat, lng);
-                                    cmd_fence_point = mavlink::apm::Pld_fence_point::Create();
-                                    Fill_target_ids(*cmd_fence_point);
-                                    (*cmd_fence_point)->lat = lat;
-                                    (*cmd_fence_point)->lng = lng;
-                                    (*cmd_fence_point)->count = poly_size;
-                                    (*cmd_fence_point)->idx = i + 1;
-                                    cmd_messages.emplace_back(cmd_fence_point);
-                                }
-                                VEHICLE_LOG_INF(vehicle, "POLYGON FENCE POINTS END. All points was put to queue.");
-                            }
-                        }
-                    }
-
-                    // if polygon data is correct or empty
-                    if (polygon_data_is_correct) {
-                        float radius;
-                        float altitude;
-                        float altitude_origin;
-                        if (params.Get_value("radius", radius)) {
-                            fence_mask |= 2;
-                            param = mavlink::Pld_param_set::Create();
-                            Fill_target_ids(*param);
-                            (*param)->param_id = "FENCE_RADIUS";
-                            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                            (*param)->param_value = radius;
-                            cmd_messages.emplace_back(param);
-                        }
-                        if (    params.Get_value("altitude_amsl", altitude)
-                            &&  params.Get_value("altitude_origin", altitude_origin))
-                        {
-                            fence_mask |= 1;
-                            param = mavlink::Pld_param_set::Create();
-                            Fill_target_ids(*param);
-                            (*param)->param_id = "FENCE_ALT_MAX";
-                            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                            (*param)->param_value = altitude - altitude_origin;
-                            cmd_messages.emplace_back(param);
-                        }
-
-                        if (fence_mask) {
-                            param = mavlink::Pld_param_set::Create();
-                            Fill_target_ids(*param);
-                            (*param)->param_id = "FENCE_MARGIN";
-                            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                            (*param)->param_value = 2;
-                            cmd_messages.emplace_back(param);
-                            param = mavlink::Pld_param_set::Create();
-                            Fill_target_ids(*param);
-                            (*param)->param_id = "FENCE_ACTION";
-                            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                            (*param)->param_value = 1; // RTL
-                            cmd_messages.emplace_back(param);
-                            param = mavlink::Pld_param_set::Create();
-                            Fill_target_ids(*param);
-                            (*param)->param_id = "FENCE_TYPE";
-                            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                            (*param)->param_value = fence_mask;
-                            cmd_messages.emplace_back(param);
-                            param = mavlink::Pld_param_set::Create();
-                            Fill_target_ids(*param);
-                            (*param)->param_id = "FENCE_ENABLE";
-                            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                            (*param)->param_value = 1;
-                            cmd_messages.emplace_back(param);
-                        } else {
-                            param = mavlink::Pld_param_set::Create();
-                            Fill_target_ids(*param);
-                            (*param)->param_id = "FENCE_ENABLE";
-                            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                            (*param)->param_value = 0;
-                            cmd_messages.emplace_back(param);
-                            param = mavlink::Pld_param_set::Create();
-                            Fill_target_ids(*param);
-                            (*param)->param_id = "FENCE_TYPE";
-                            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                            (*param)->param_value = 0;
-                            cmd_messages.emplace_back(param);
-                        }
-                    }
-                } else if (cmd == vehicle.c_trigger_calibration) {
-                    // gyro (param1)
-                    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-                    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_PREFLIGHT_CALIBRATION;
-                    (*cmd_long)->param1 = 1;
-                    cmd_messages.emplace_back(cmd_long);
-
-                    // param2 not supported by ardupilot
-
-                    // baro (param3)
-                    cmd_long = mavlink::Pld_command_long::Create();
-                    Fill_target_ids(*cmd_long);
-                    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-                    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_PREFLIGHT_CALIBRATION;
-                    (*cmd_long)->param3 = 1;
-                    cmd_messages.emplace_back(cmd_long);
-
-                    // skip radio calibration (param4) as it requires user interaction.
-
-                    // skip accelerometer (param5) calibration as it requires vehicle to be level.
-
-                    // skip compass (param6) calibration as it requires vehicle to be rotated manually.
-                } else if (cmd == vehicle.c_trigger_reboot) {
-                    // sanity check
-                    if (ardu_vehicle.Is_armed() || ardu_vehicle.is_airborne) {
-                        vehicle.Command_failed(ucs_request,
-                                               "Reboot is denied. UAV is armed or airborne.",
-                                               proto::STATUS_FAILED);
-                    } else {
-                        cmd_long = mavlink::Pld_command_long::Create();
-                        Fill_target_ids(*cmd_long);
-                        (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-                        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN;
-                        (*cmd_long)->param1 = 1; // reboot;
-                        cmd_messages.emplace_back(cmd_long);
-                    }
-                }
-            } catch (const std::exception& ex) {
-                vehicle.Command_failed(ucs_request, ex.what(), proto::STATUS_INVALID_PARAM);
+        try {
+            params = cmd->Build_parameter_list(vsm_cmd);
+            if (cmd == vehicle.c_adsb_set_mode) {
+                Process_adsb_set_mode(params);
+            } else if (cmd == vehicle.c_adsb_set_parameter) {
+                Process_adsb_set_parameter(params);
+            } else if (cmd == vehicle.c_adsb_set_ident) {
+                Process_adsb_set_ident();
+            } else if (cmd == vehicle.c_emergency_land) {
+                Process_emergency_land();
+            } else if (cmd == vehicle.c_set_servo) {
+                Process_set_servo(params);
+            } else if (cmd == vehicle.c_repeat_servo) {
+                Process_repeat_servo(params);
+            } else if (cmd == vehicle.c_set_fence) {
+                Process_set_fence(params);
+            } else if (cmd == vehicle.c_trigger_calibration) {
+                Process_calibration();
+            } else if (cmd == vehicle.c_trigger_reboot) {
+                Process_reboot();
+            } else if (cmd == vehicle.c_takeoff_command) {
+                Process_takeoff(params);
+            } else if (cmd == vehicle.c_set_heading) {
+                Process_heading(params);
+            } else if (cmd == vehicle.c_set_relative_heading) {
+                Process_relative_heading(params);
+            } else if (cmd == vehicle.c_resume) {
+                Process_resume();
+            } else if (cmd == vehicle.c_pause) {
+                Process_pause();
+            } else if (cmd == vehicle.c_auto) {
+                Process_auto();
+            } else if (cmd == vehicle.c_manual) {
+                Process_manual();
+            } else if (cmd == vehicle.c_joystick) {
+                Process_joystick();
+            } else if (cmd == vehicle.c_rth) {
+                Process_rth();
+            } else if (cmd == vehicle.c_land_command) {
+                Process_land();
+            } else if (cmd == vehicle.c_waypoint) {
+                Process_waypoint(params);
+            } else if (cmd == vehicle.c_arm) {
+                Process_arm();
+            } else if (cmd == vehicle.c_disarm) {
+                Process_disarm();
+            } else if (cmd == vehicle.c_guided) {
+                Process_guided();
+            } else if (cmd == vehicle.c_camera_trigger_command) {
+                Process_camera_trigger();
+            } else if (cmd == vehicle.c_direct_vehicle_control) {
+                Process_direct_vehicle_control(params);
+            } else if (cmd == vehicle.c_write_parameter) {
+                Process_write_parameter(params);
             }
+        } catch (const std::exception& ex) {
+            vehicle.Command_failed(ucs_request, ex.what(), proto::STATUS_INVALID_PARAM);
         }
+    }
+    command_count = cmd_messages.size();
+    Try();
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_relative_heading(const Property_list& params)
+{
+    Stop_camera_series();
+    if (!ardu_vehicle.Is_armed()) {
+        Disable("Vehicle is not armed.");
     } else {
-        double heading;
-        float pitch;
-        float yaw;
-        switch (vehicle_command_request->Get_type()) {
-        case Vehicle_command::Type::RESUME_MISSION:
-            // Resume mission only if vehicle is in normal flight conditions
-            if (ardu_vehicle.Is_armed() && ardu_vehicle.is_airborne) {
-                if (vehicle.Is_flight_mode(proto::FLIGHT_MODE_HOLD)) {
-                    int command_idx;
-                    if (vehicle.t_current_command->Get_value(command_idx)) {
-                        auto set_cur = mavlink::Pld_mission_set_current::Create();
-                        Fill_target_ids(*set_cur);
-                        (*set_cur)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-                        (*set_cur)->seq = command_idx + 1;
-                        cmd_messages.emplace_back(set_cur);
-                    }
-                } else {
-                    param = mavlink::Pld_param_set::Create();
-                    Fill_target_ids(*param);
-                    (*param)->param_id = "MIS_RESTART";
-                    (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-                    (*param)->param_value = 0;
-                    cmd_messages.emplace_back(param);
-                    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-                    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_MISSION_START;
-                    cmd_messages.emplace_back(cmd_long);
-                }
-            } else {
-                Disable("Vehicle is not in normal flight conditions to perform RESUME MISSION command.");
-            }
-            break;
+        float heading = 0;
+        if (params.Get_value("relative_heading", heading)) {
+            Generate_wp_from_current_position();
+            auto cmd_mission_item = mavlink::Pld_mission_item::Create();
+            Fill_target_ids(*cmd_mission_item);
+            (*cmd_mission_item)->current = 2;
+            (*cmd_mission_item)->frame = mavlink::MAV_FRAME_GLOBAL_RELATIVE_ALT;
+            (*cmd_mission_item)->autocontinue = 1;
+            (*cmd_mission_item)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_YAW;
+            // yaw angle
+            (*cmd_mission_item)->param1 = heading * 180.0 / M_PI;
+            // Use default angular speed (AUTO_YAW_SLEW_RATE == 60 deg/s)
+            (*cmd_mission_item)->param2 = 0;
+            // relative angle
+            (*cmd_mission_item)->param4 = 1;
+            cmd_messages.emplace_back(cmd_mission_item);
+        } else {
+            Disable("Heading not present");
+        }
+    }
+}
 
-        case Vehicle_command::Type::AUTO_MODE:
-            ardu_vehicle.Stop_rc_override();
-            param = mavlink::Pld_param_set::Create();
-            Fill_target_ids(*param);
-            (*param)->param_id = "MIS_RESTART";
-            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-            (*param)->param_value = 1;
-            cmd_messages.emplace_back(param);
-            (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-            (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_MISSION_START;
-            cmd_messages.emplace_back(cmd_long);
-            // Reset MIS_RESTART back to 0 so that next time user enters AUTO from
-            // RC tx, vehicle continues mission instead of returning back to WP1.
-            param = mavlink::Pld_param_set::Create();
-            Fill_target_ids(*param);
-            (*param)->param_id = "MIS_RESTART";
-            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-            (*param)->param_value = 0;
-            cmd_messages.emplace_back(param);
-            break;
-
-        case Vehicle_command::Type::MANUAL_MODE:
-            /* Current Ardupilot firmware does not send responses to mode changes,
-             * so just check the current mode as an indication of completed
-             * request. */
-            if (vehicle.Is_control_mode(proto::CONTROL_MODE_MANUAL)) {
-                vehicle_command_request.Succeed();
-            } else {
-                cmd_set_mode = ugcs::vsm::mavlink::Pld_set_mode::Create();
-                Fill_target_system_id(*cmd_set_mode);
-                (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
-                (*cmd_set_mode)->custom_mode = Get_custom_manual_mode();
-                cmd_messages.emplace_back(cmd_set_mode);
-            }
-            ardu_vehicle.Stop_rc_override();
-            break;
-
-        case Vehicle_command::Type::ARM:
-            (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-            (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
-            (*cmd_long)->param1 = 1; /* Do arm. */
-            cmd_messages.emplace_back(cmd_long);
-            Register_status_text();
-            break;
-
-        case Vehicle_command::Type::DISARM:
-            (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-            (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
-            (*cmd_long)->param1 = 0; /* Do disarm. */
-            cmd_messages.emplace_back(cmd_long);
-            break;
-
-        case Vehicle_command::Type::PAUSE_MISSION:
-            // If vehicle is in guided mode already then
-            // briefly move into manual to reset current guided WP and then
-            // switch back to guided so the vehicle hovers at current position.
-            if (vehicle.Is_control_mode(proto::CONTROL_MODE_CLICK_GO)) {
-                cmd_set_mode = ugcs::vsm::mavlink::Pld_set_mode::Create();
-                Fill_target_system_id(*cmd_set_mode);
-                (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
-                (*cmd_set_mode)->custom_mode = Get_custom_manual_mode();
-                cmd_messages.emplace_back(cmd_set_mode);
-            }
-            // Enter GUIDED mode.
-            cmd_set_mode = mavlink::Pld_set_mode::Create();
-            (*cmd_set_mode)->target_system = vehicle.real_system_id;
-            (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
-            (*cmd_set_mode)->custom_mode = Get_custom_guided_mode();
-            cmd_messages.emplace_back(cmd_set_mode);
-            break;
-
-        case Vehicle_command::Type::GUIDED_MODE:
-            // Enter GUIDED mode.
-            ardu_vehicle.Stop_rc_override();
-            cmd_set_mode = mavlink::Pld_set_mode::Create();
-            (*cmd_set_mode)->target_system = vehicle.real_system_id;
-            (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
-            (*cmd_set_mode)->custom_mode = Get_custom_guided_mode();
-            cmd_messages.emplace_back(cmd_set_mode);
-            break;
-
-        case Vehicle_command::Type::WAYPOINT:
-            // Does 4 things:
-            // Enter guided mode if needed
-            // Change current speed
-            // Change yaw if needed
-            // Got to WP
-            if (!vehicle.Is_control_mode(proto::CONTROL_MODE_CLICK_GO)) {
-                ardu_vehicle.Stop_rc_override();
-                // Enter GUIDED mode.
-                cmd_set_mode = mavlink::Pld_set_mode::Create();
-                (*cmd_set_mode)->target_system = vehicle.real_system_id;
-                (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
-                (*cmd_set_mode)->custom_mode = Get_custom_guided_mode();
-                cmd_messages.emplace_back(cmd_set_mode);
-            }
-
-            heading = vehicle_command_request->Get_heading();
-
-            param = mavlink::Pld_param_set::Create();
-            Fill_target_ids(*param);
-            if (ardu_vehicle.Get_type() == Type::PLANE) {
-                (*param)->param_id = "TRIM_ARSPD_CM";
-                (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
-                (*param)->param_value = vehicle_command_request->Get_speed() * 100;
-                cmd_messages.emplace_back(param);
-            } else if (ardu_vehicle.Get_type() == Type::COPTER) {
-                (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_CHANGE_SPEED;
-                (*cmd_long)->param1 = vehicle_command_request->Get_speed();
-                (*cmd_long)->param2 = vehicle_command_request->Get_speed();
-                cmd_messages.emplace_back(cmd_long);
-
-                (*param)->param_id = "WPNAV_SPEED";
-                (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-                (*param)->param_value = vehicle_command_request->Get_speed() * 100;
-                cmd_messages.emplace_back(param);
-
-                if (!std::isnan(heading)) {
-                    // we have heading specified. turn first.
-                    cmd_mission_item = mavlink::Pld_mission_item::Create();
-                    Fill_target_ids(*cmd_mission_item);
-                    (*cmd_mission_item)->current = 2;
-                    (*cmd_mission_item)->frame = mavlink::MAV_FRAME_GLOBAL_RELATIVE_ALT;
-                    (*cmd_mission_item)->autocontinue = 1;
-                    (*cmd_mission_item)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_YAW;
-                    // yaw angle
-                    (*cmd_mission_item)->param1 = heading * 180.0 / M_PI;
-                    // Use default angular speed (AUTO_YAW_SLEW_RATE == 60 deg/s)
-                    (*cmd_mission_item)->param2 = 0;
-                    // absolute angle
-                    (*cmd_mission_item)->param4 = 0;
-                    cmd_messages.emplace_back(cmd_mission_item);
-                }
-            }
-
-            cmd_mission_item = mavlink::Pld_mission_item::Create();
+void
+Ardupilot_vehicle::Vehicle_command_act::Generate_wp_from_current_position()
+{
+    if (ardu_vehicle.set_heading_needs_wp) {
+        VEHICLE_LOG_INF(vehicle, "Generating WP at current position for heading to work.");
+        float altitude;
+        double latitude;
+        double longitude;
+        if (vehicle.t_latitude->Get_value(latitude) &&
+            vehicle.t_altitude_raw->Get_value(altitude) &&
+            vehicle.t_longitude->Get_value(longitude)) {
+            auto cmd_mission_item = mavlink::Pld_mission_item::Create();
             Fill_target_ids(*cmd_mission_item);
             (*cmd_mission_item)->current = 2;
             (*cmd_mission_item)->frame = mavlink::MAV_FRAME_GLOBAL_RELATIVE_ALT;
             (*cmd_mission_item)->autocontinue = 1;
             (*cmd_mission_item)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
             (*cmd_mission_item)->param1 = 0; // hold time
-            (*cmd_mission_item)->param2 = vehicle_command_request->Get_acceptance_radius(); // acct radius
+            (*cmd_mission_item)->param2 = 20; // acct radius
             (*cmd_mission_item)->param3 = 0; // passby radius
-            (*cmd_mission_item)->param4 = heading * 180.0 / M_PI; // yaw angle
-            (*cmd_mission_item)->x = vehicle_command_request->Get_latitude() * 180.0 / M_PI;
-            (*cmd_mission_item)->y = vehicle_command_request->Get_longitude() * 180.0 / M_PI;
-            (*cmd_mission_item)->z =
-                vehicle_command_request->Get_altitude() - vehicle_command_request->Get_takeoff_altitude();
+            (*cmd_mission_item)->param4 = NAN;
+            (*cmd_mission_item)->x = latitude * 180.0 / M_PI;
+            (*cmd_mission_item)->y = longitude * 180.0 / M_PI;
+            (*cmd_mission_item)->z = altitude;
             cmd_messages.emplace_back(cmd_mission_item);
-            break;
-
-        case Vehicle_command::Type::LAND:
-            (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-            (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LAND;
-            cmd_messages.emplace_back(cmd_long);
-            break;
-
-        case Vehicle_command::Type::JOYSTICK_CONTROL_MODE:
-            if (vehicle.Is_control_mode(proto::CONTROL_MODE_JOYSTICK)) {
-                vehicle_command_request.Succeed();
-            } else {
-                // Set vehicle in manual mode and start pushing RC_CHANNELS_OVERRIDE messages.
-                cmd_set_mode = ugcs::vsm::mavlink::Pld_set_mode::Create();
-                Fill_target_system_id(*cmd_set_mode);
-                (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
-                (*cmd_set_mode)->custom_mode = Get_custom_manual_mode();
-                cmd_messages.emplace_back(cmd_set_mode);
-            }
-            ardu_vehicle.Start_rc_override();
-            break;
-
-        case Vehicle_command::Type::DIRECT_VEHICLE_CONTROL:
-    //        LOG("Direct Vehicle (rpyt) %1.3f %1.3f %1.3f %1.3f",
-    //            vehicle_command_request->Get_roll(),
-    //            vehicle_command_request->Get_pitch(),
-    //            vehicle_command_request->Get_yaw(),
-    //            vehicle_command_request->Get_throttle()
-    //            );
-            if (!vehicle.Is_control_mode(proto::CONTROL_MODE_JOYSTICK)) {
-                break;
-            }
-            ardu_vehicle.direct_vehicle_control_last_received = std::chrono::steady_clock::now();
-            pitch = vehicle_command_request->Get_pitch();
-            yaw = vehicle_command_request->Get_yaw();
-
-            // Normalize axes depending on vehicle type.
-            if (ardu_vehicle.Get_type() == Type::COPTER) {
-                pitch = -pitch;         // pitch is reversed for copter.
-                yaw = yaw * 0.4;    // yaw on copter is too sensitive.
-            } else {
-                yaw = -yaw;     // yaw is reversed for plane.
-            }
-
-            ardu_vehicle.Set_rc_override(
-                (vehicle_command_request->Get_roll() * 500.0) + 1500,
-                (pitch * 500.0) + 1500,
-                (vehicle_command_request->Get_throttle() * 500.0) + 1500,
-                (yaw * 500.0) + 1500);
-            ardu_vehicle.Send_rc_override();
-            break;
-
-        case Vehicle_command::Type::DIRECT_PAYLOAD_CONTROL:
-    //        LOG("Direct Payload %d (rpyz) %1.3f %1.3f %1.3f %1.3f",
-    //            vehicle_command_request->Get_payload_id(),
-    //            vehicle_command_request->Get_roll(),
-    //            vehicle_command_request->Get_pitch(),
-    //            vehicle_command_request->Get_yaw(),
-    //            vehicle_command_request->Get_zoom()
-    //            );
-            break;
-
-        case Vehicle_command::Type::RETURN_HOME:
-            (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
-            (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_NAV_RETURN_TO_LAUNCH;
-            cmd_messages.emplace_back(cmd_long);
-            break;
-
-        default:
-            break;
+            ardu_vehicle.set_heading_needs_wp = false;
+        } else {
+            VEHICLE_LOG_INF(vehicle, "Failed to get current position. Heading ignored.");
         }
     }
-    Try();
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_heading(const Property_list& params)
+{
+    Stop_camera_series();
+    if (!ardu_vehicle.Is_armed()) {
+        Disable("Vehicle is not armed.");
+    } else {
+        float heading = 0;
+        if (params.Get_value("heading", heading)) {
+            Generate_wp_from_current_position();
+            auto cmd_mission_item = mavlink::Pld_mission_item::Create();
+            Fill_target_ids(*cmd_mission_item);
+            (*cmd_mission_item)->current = 2;
+            (*cmd_mission_item)->frame = mavlink::MAV_FRAME_GLOBAL_RELATIVE_ALT;
+            (*cmd_mission_item)->autocontinue = 1;
+            (*cmd_mission_item)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_YAW;
+            // yaw angle
+            (*cmd_mission_item)->param1 = heading * 180.0 / M_PI;
+            // Use default angular speed (AUTO_YAW_SLEW_RATE == 60 deg/s)
+            (*cmd_mission_item)->param2 = 0;
+            // absolute angle
+            (*cmd_mission_item)->param4 = 0;
+            cmd_messages.emplace_back(cmd_mission_item);
+        } else {
+            Disable("Heading not present");
+        }
+    }
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_takeoff(const Property_list& params)
+{
+    if (ardu_vehicle.is_airborne) {
+        Disable("Vehicle already airborne.");
+    } else if (!ardu_vehicle.Is_armed()) {
+        Disable("Vehicle is not armed.");
+    } else {
+        float altitude;
+        if (!params.Get_value("relative_altitude", altitude)) {
+            VEHICLE_LOG_INF(
+                vehicle,
+                "Takeoff altitude not set, using default %f m.", DEFAULT_TAKEOFF_ALTITUDE);
+            altitude = DEFAULT_TAKEOFF_ALTITUDE;
+        }
+        if (!vehicle.Is_control_mode(proto::CONTROL_MODE_CLICK_GO)) {
+            ardu_vehicle.Stop_rc_override();
+            // Enter GUIDED mode.
+            auto cmd_set_mode = mavlink::Pld_set_mode::Create();
+            (*cmd_set_mode)->target_system = vehicle.real_system_id;
+            (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+            (*cmd_set_mode)->custom_mode = Get_custom_guided_mode();
+            cmd_messages.emplace_back(cmd_set_mode);
+        }
+        auto cmd_long = mavlink::Pld_command_long::Create();
+        Fill_target_ids(*cmd_long);
+        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_NAV_TAKEOFF;
+        (*cmd_long)->param7 = altitude;
+        cmd_messages.emplace_back(cmd_long);
+    }
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_reboot()
+{
+    // sanity check
+    if (ardu_vehicle.Is_armed() || ardu_vehicle.is_airborne) {
+        Disable("Reboot is denied. UAV is armed or airborne.");
+    } else {
+        auto cmd_long = mavlink::Pld_command_long::Create();
+        Fill_target_ids(*cmd_long);
+        (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN;
+        (*cmd_long)->param1 = 1; // reboot;
+        cmd_messages.emplace_back(cmd_long);
+    }
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_calibration()
+{
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    // gyro (param1)
+    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_PREFLIGHT_CALIBRATION;
+    (*cmd_long)->param1 = 1;
+    cmd_messages.emplace_back(cmd_long);
+
+    // param2 not supported by ardupilot
+
+    // baro (param3)
+    cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_PREFLIGHT_CALIBRATION;
+    (*cmd_long)->param3 = 1;
+    cmd_messages.emplace_back(cmd_long);
+
+    // skip radio calibration (param4) as it requires user interaction.
+
+    // skip accelerometer (param5) calibration as it requires vehicle to be level.
+
+    // skip compass (param6) calibration as it requires vehicle to be rotated manually.
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_set_fence(const Property_list& params)
+{
+    proto::List_value lats, lngs;
+
+    /* bitmask, fence type
+       0: no fence
+       1 bit: altitude fence
+       2 bit: cicrle fence
+       3 bit: polygon fence (after ardupilot 3.4). */
+    int8_t fence_mask = 0;
+
+
+    bool polygon_data_is_correct = true;
+
+    if (params.Get_value("latitudes", lats) && params.Get_value("longitudes", lngs)) {
+        polygon_data_is_correct = false;
+        int poly_size = lats.values_size();
+        VEHICLE_LOG_INF(vehicle, "Adding polygon fence, Polygon size = %d", poly_size);
+
+        // check if polygon data is correct
+        if (!ardu_vehicle.Is_home_position_valid()) {
+            // Need valid home location
+            vehicle.Command_failed(ucs_request,
+                                   "Polygon fence: home location is not valid.",
+                                   proto::STATUS_INVALID_PARAM);
+        } else if (poly_size != lngs.values_size()) {
+            // ERROR: non equal points number
+            vehicle.Command_failed(ucs_request,
+                                   "Polygon fence: non equal number of points in lists",
+                                   proto::STATUS_INVALID_PARAM);
+        } else if (poly_size < 4) {
+            // ERROR: too few points
+            vehicle.Command_failed(ucs_request,
+                                   "Polygon fence: need at last 4 points for polygon fence",
+                                   proto::STATUS_INVALID_PARAM);
+        } else if (poly_size > 84) {
+            // ERROR: too much points
+            vehicle.Command_failed(ucs_request,
+                                   "Polygon fence: need no more than 84 points for polygon fence",
+                                   proto::STATUS_INVALID_PARAM);
+        } else if (lats.values(0).double_value() !=  lats.values(poly_size-1).double_value() ||
+                   lngs.values(0).double_value() !=  lngs.values(poly_size-1).double_value()) {
+            // ERROR: first point mast be equal to last point in polygon description
+            vehicle.Command_failed(ucs_request,
+               "Polygon fence: first point mast be equal to last point in polygon description",
+               proto::STATUS_INVALID_PARAM);
+        } else if (Is_Outside_Polygon(ardu_vehicle.home_location.latitude,
+                                      ardu_vehicle.home_location.longitude,
+                                      lats, lngs)) {
+            // ERROR: home location mas be inside polygon
+            VEHICLE_LOG_INF(vehicle, "HOME LOCATION : %2.20f, %2.20f",
+                            ardu_vehicle.home_location.latitude,
+                            ardu_vehicle.home_location.longitude);
+
+            vehicle.Command_failed(ucs_request,
+                                   "Polygon fence: Home Location must be inside polygon",
+                                   proto::STATUS_INVALID_PARAM);
+        } else {
+            polygon_data_is_correct = true;
+            // check if all values are double
+            for (int i = 0; i < poly_size; i++) {
+                if (!(lats.values(i).has_double_value() && lngs.values(i).has_double_value())) {
+                    vehicle.Command_failed(ucs_request,
+                                           "Polygon fence: incorrect latitude and longitude values",
+                                           proto::STATUS_INVALID_PARAM);
+                    polygon_data_is_correct = false;
+                }
+            }
+
+            if (polygon_data_is_correct) {
+                fence_mask |= 4;
+                // set fence size
+                auto param = mavlink::Pld_param_set::Create();
+                Fill_target_ids(*param);
+                (*param)->param_id = "FENCE_TOTAL";
+                (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+                // +1 cause fist point we send is returning point.
+                (*param)->param_value = poly_size + 1;
+                cmd_messages.emplace_back(param);
+
+                // zero-point: Virtual return point.
+                // Virtual - because Copter returns to land point
+                // and not to this "return point". But "return point" needs to be inside
+                // polygon anyway due to strange ardupilot logic. So we set return point
+                // to Home Location and check that it is inside polygon (earlier) with
+                // function Is_Outside_Polygon.
+                VEHICLE_LOG_INF(vehicle, "Virtual return point(0) : %2.20f, %2.20f",
+                                ardu_vehicle.home_location.latitude * 180.0f / M_PI,
+                                ardu_vehicle.home_location.longitude * 180.0f / M_PI);
+                auto cmd_fence_point = mavlink::apm::Pld_fence_point::Create();
+                Fill_target_ids(*cmd_fence_point);
+                (*cmd_fence_point)->lat = ardu_vehicle.home_location.latitude * 180.0f / M_PI;
+                (*cmd_fence_point)->lng = ardu_vehicle.home_location.longitude * 180.0f / M_PI;
+                (*cmd_fence_point)->count = poly_size;
+                (*cmd_fence_point)->idx = 0;
+                cmd_messages.emplace_back(cmd_fence_point);
+
+                VEHICLE_LOG_INF(vehicle, "POLYGON FENCE POINTS:");
+                for (int i = 0; i < poly_size; i++) {
+                    double lat = lats.values(i).double_value()* 180.0f / M_PI;
+                    double lng = lngs.values(i).double_value()* 180.0f / M_PI;
+                    VEHICLE_LOG_INF(vehicle, "%d : %2.20f, %2.20f", i, lat, lng);
+                    cmd_fence_point = mavlink::apm::Pld_fence_point::Create();
+                    Fill_target_ids(*cmd_fence_point);
+                    (*cmd_fence_point)->lat = lat;
+                    (*cmd_fence_point)->lng = lng;
+                    (*cmd_fence_point)->count = poly_size;
+                    (*cmd_fence_point)->idx = i + 1;
+                    cmd_messages.emplace_back(cmd_fence_point);
+                }
+                VEHICLE_LOG_INF(vehicle, "POLYGON FENCE POINTS END. All points was put to queue.");
+            }
+        }
+    }
+
+    // if polygon data is correct or empty
+    if (polygon_data_is_correct) {
+        float radius;
+        float altitude;
+        float altitude_origin;
+        if (params.Get_value("radius", radius)) {
+            fence_mask |= 2;
+            auto param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_RADIUS";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+            (*param)->param_value = radius;
+            cmd_messages.emplace_back(param);
+        }
+        if (    params.Get_value("altitude_amsl", altitude)
+            &&  params.Get_value("altitude_origin", altitude_origin))
+        {
+            fence_mask |= 1;
+            auto param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_ALT_MAX";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+            (*param)->param_value = altitude - altitude_origin;
+            cmd_messages.emplace_back(param);
+        } else if (params.Get_value("altitude_raw", altitude)) {
+            fence_mask |= 1;
+            auto param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_ALT_MAX";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+            (*param)->param_value = altitude;
+            cmd_messages.emplace_back(param);
+        }
+
+        if (fence_mask) {
+            auto param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_MARGIN";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+            (*param)->param_value = 2;
+            cmd_messages.emplace_back(param);
+            param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_ACTION";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+            (*param)->param_value = 1; // RTL
+            cmd_messages.emplace_back(param);
+            param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_TYPE";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+            (*param)->param_value = fence_mask;
+            cmd_messages.emplace_back(param);
+            param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_ENABLE";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+            (*param)->param_value = 1;
+            cmd_messages.emplace_back(param);
+        } else {
+            auto param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_ENABLE";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+            (*param)->param_value = 0;
+            cmd_messages.emplace_back(param);
+            param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "FENCE_TYPE";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+            (*param)->param_value = 0;
+            cmd_messages.emplace_back(param);
+        }
+    }
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_repeat_servo(const Property_list& params)
+{
+    int servo_id;
+    int pwm;
+    int count;
+    float delay;
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    params.Get_value("servo_id", servo_id);
+    params.Get_value("pwm", pwm);
+    params.Get_value("delay", delay);
+    params.Get_value("count", count);
+    (*cmd_long)->command = mavlink::MAV_CMD_DO_REPEAT_SERVO;
+    (*cmd_long)->param1 = servo_id;
+    (*cmd_long)->param2 = pwm;
+    (*cmd_long)->param3 = count;
+    if (delay < 0.2) {
+        (*cmd_long)->param4 = 0;
+    } else {
+        // Pixhawk does this slower than expected. Add coefficient.
+        (*cmd_long)->param4 = delay * 2 - 0.4;
+    }
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_set_servo(const Property_list& params)
+{
+    int servo_id;
+    int pwm;
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    params.Get_value("servo_id", servo_id);
+    params.Get_value("pwm", pwm);
+    (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_SERVO;
+    (*cmd_long)->param1 = servo_id;
+    (*cmd_long)->param2 = pwm;
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_adsb_set_mode(const Property_list& params)
+{
+    int mode;
+    if (params.Get_value("mode", mode)) {
+        auto cmd_long = mavlink::Pld_command_long::Create();
+        Fill_target_ids(*cmd_long);
+        (*cmd_long)->command = mavlink::sph::MAV_CMD_ADSB_SET_MODE;
+        switch (mode) {
+        case proto::ADSB_MODE_OFF:
+            (*cmd_long)->param1 = mavlink::sph::ADSB_TRANSPONDER_MODE_OFF;
+            break;
+        case proto::ADSB_MODE_ON:
+            (*cmd_long)->param1 = mavlink::sph::ADSB_TRANSPONDER_MODE_ON;
+            break;
+        case proto::ADSB_MODE_STBY:
+            (*cmd_long)->param1 = mavlink::sph::ADSB_TRANSPONDER_MODE_STBY;
+            break;
+        case proto::ADSB_MODE_ALT:
+            (*cmd_long)->param1 = mavlink::sph::ADSB_TRANSPONDER_MODE_ALT;
+            break;
+        default:
+            VSM_EXCEPTION(Invalid_param_exception, "Unsupported mode");
+        }
+        cmd_messages.emplace_back(cmd_long);
+    } else {
+        VSM_EXCEPTION(Invalid_param_exception, "Unsupported mode");
+    }
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_adsb_set_parameter(const Property_list& params)
+{
+    int int_value;
+    std::string str_value;
+    if (params.Get_value("adsb_icao", int_value)) {
+        auto param = mavlink::Pld_param_set::Create();
+        Fill_target_ids(*param);
+        (*param)->param_id = "ADSB_ICAO_ID";
+        (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
+        (*param)->param_value = int_value;
+        cmd_messages.emplace_back(param);
+    }
+    if (params.Get_value("adsb_squawk", int_value)) {
+        auto param = mavlink::Pld_param_set::Create();
+        Fill_target_ids(*param);
+        (*param)->param_id = "ADSB_SQUAWK";
+        (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
+        (*param)->param_value = int_value;
+        cmd_messages.emplace_back(param);
+    }
+    if (params.Get_value("adsb_registration", str_value)) {
+        auto param = mavlink::sph::Pld_param_str_set::Create();
+        Fill_target_ids(*param);
+        (*param)->param_id = "ADSB_TAIL";
+        (*param)->param_value = str_value;
+        cmd_messages.emplace_back(param);
+    }
+    if (params.Get_value("adsb_flight_id", str_value)) {
+        auto param = mavlink::sph::Pld_param_str_set::Create();
+        Fill_target_ids(*param);
+        (*param)->param_id = "ADSB_FLIGHT";
+        (*param)->param_value = str_value;
+        cmd_messages.emplace_back(param);
+    }
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_adsb_set_ident()
+{
+    auto param = mavlink::Pld_param_set::Create();
+    Fill_target_ids(*param);
+    (*param)->param_id = "ADSB_IDENT";
+    (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
+    (*param)->param_value = 1;
+    cmd_messages.emplace_back(param);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_emergency_land()
+{
+    Stop_camera_series();
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
+    (*cmd_long)->param1 = 0; /* Do disarm. */
+    (*cmd_long)->param2 = DISARM_MAGIC_VALUE; // do hard disarm (even when copter is airborne)
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_auto()
+{
+    ardu_vehicle.Stop_rc_override();
+    auto param = mavlink::Pld_param_set::Create();
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*param)->param_id = "MIS_RESTART";
+    (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+    (*param)->param_value = 1;
+    cmd_messages.emplace_back(param);
+    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_MISSION_START;
+    cmd_messages.emplace_back(cmd_long);
+    // Reset MIS_RESTART back to 0 so that next time user enters AUTO from
+    // RC tx, vehicle continues mission instead of returning back to WP1.
+    param = mavlink::Pld_param_set::Create();
+    Fill_target_ids(*param);
+    (*param)->param_id = "MIS_RESTART";
+    (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+    (*param)->param_value = 0;
+    cmd_messages.emplace_back(param);
+    ardu_vehicle.set_heading_needs_wp = false;
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_manual()
+{
+    Stop_camera_series();
+    /* Current Ardupilot firmware does not send responses to mode changes,
+     * so just check the current mode as an indication of completed
+     * request. */
+    if (vehicle.Is_control_mode(proto::CONTROL_MODE_MANUAL)) {
+        Disable_success();
+    } else {
+        auto cmd_set_mode = mavlink::Pld_set_mode::Create();
+        Fill_target_system_id(*cmd_set_mode);
+        (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+        (*cmd_set_mode)->custom_mode = Get_custom_manual_mode();
+        cmd_messages.emplace_back(cmd_set_mode);
+    }
+    ardu_vehicle.Stop_rc_override();
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_arm()
+{
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
+    (*cmd_long)->param1 = 1; /* Do arm. */
+    cmd_messages.emplace_back(cmd_long);
+    Register_status_text();
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_disarm()
+{
+    Stop_camera_series();
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_COMPONENT_ARM_DISARM;
+    (*cmd_long)->param1 = 0; /* Do disarm. */
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_pause()
+{
+    Stop_camera_series();
+    // If vehicle is in guided mode already then
+    // briefly move into manual to reset current guided WP and then
+    // switch back to guided so the vehicle hovers at current position.
+    if (vehicle.Is_control_mode(proto::CONTROL_MODE_CLICK_GO)) {
+        auto cmd_set_mode = mavlink::Pld_set_mode::Create();
+        Fill_target_system_id(*cmd_set_mode);
+        (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+        (*cmd_set_mode)->custom_mode = Get_custom_manual_mode();
+        cmd_messages.emplace_back(cmd_set_mode);
+    }
+    // Enter GUIDED mode.
+    auto cmd_set_mode = mavlink::Pld_set_mode::Create();
+    Fill_target_system_id(*cmd_set_mode);
+    cmd_set_mode = mavlink::Pld_set_mode::Create();
+    (*cmd_set_mode)->target_system = vehicle.real_system_id;
+    (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+    (*cmd_set_mode)->custom_mode = Get_custom_guided_mode();
+    cmd_messages.emplace_back(cmd_set_mode);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_resume()
+{
+    // Resume mission only if vehicle is in normal flight conditions
+    if (ardu_vehicle.Is_armed() && ardu_vehicle.is_airborne) {
+        if (vehicle.Is_flight_mode(proto::FLIGHT_MODE_HOLD)) {
+            int command_idx;
+            if (vehicle.t_current_command->Get_value(command_idx)) {
+                auto set_cur = mavlink::Pld_mission_set_current::Create();
+                Fill_target_ids(*set_cur);
+                (*set_cur)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+                (*set_cur)->seq = command_idx + 1;
+                cmd_messages.emplace_back(set_cur);
+            }
+        } else {
+            auto param = mavlink::Pld_param_set::Create();
+            Fill_target_ids(*param);
+            (*param)->param_id = "MIS_RESTART";
+            (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+            (*param)->param_value = 0;
+            cmd_messages.emplace_back(param);
+            auto cmd_long = mavlink::Pld_command_long::Create();
+            Fill_target_ids(*cmd_long);
+            (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+            (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_MISSION_START;
+            cmd_messages.emplace_back(cmd_long);
+        }
+    } else {
+        Disable("Vehicle is not in normal flight conditions to perform RESUME MISSION command.");
+    }
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_waypoint(const Property_list& params)
+{
+    // Does 4 things:
+    // Enter guided mode if needed
+    // Change current speed
+    // Change yaw if needed
+    // Got to WP
+    float altitude_amsl;
+    float altitude_origin;
+    float speed;
+    double latitude;
+    double longitude;
+    float acceptance_radius;
+    float heading = NAN;
+
+    params.at("ground_speed")->Get_value(speed);
+    params.at("altitude_amsl")->Get_value(altitude_amsl);
+    params.at("altitude_origin")->Get_value(altitude_origin);
+    params.at("latitude")->Get_value(latitude);
+    params.at("longitude")->Get_value(longitude);
+    params.at("acceptance_radius")->Get_value(acceptance_radius);
+
+    if (!vehicle.Is_control_mode(proto::CONTROL_MODE_CLICK_GO)) {
+        Stop_camera_series();
+        ardu_vehicle.Stop_rc_override();
+        // Enter GUIDED mode.
+        auto cmd_set_mode = mavlink::Pld_set_mode::Create();
+        (*cmd_set_mode)->target_system = vehicle.real_system_id;
+        (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+        (*cmd_set_mode)->custom_mode = Get_custom_guided_mode();
+        cmd_messages.emplace_back(cmd_set_mode);
+    }
+
+    auto param = mavlink::Pld_param_set::Create();
+    Fill_target_ids(*param);
+    if (vehicle.Get_vehicle_type() == proto::VEHICLE_TYPE_FIXED_WING ||
+        vehicle.Get_vehicle_type() == proto::VEHICLE_TYPE_VTOL) {
+        (*param)->param_id = "TRIM_ARSPD_CM";
+        (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT32;
+        (*param)->param_value = static_cast<int32_t>(speed * 100);
+        cmd_messages.emplace_back(param);
+    } else if (ardu_vehicle.Is_copter()) {
+        auto cmd_long = mavlink::Pld_command_long::Create();
+        Fill_target_ids(*cmd_long);
+        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_CHANGE_SPEED;
+        (*cmd_long)->param1 = speed;
+        (*cmd_long)->param2 = speed;
+        cmd_messages.emplace_back(cmd_long);
+
+        (*param)->param_id = "WPNAV_SPEED";
+        (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+        (*param)->param_value = speed * 100;
+        cmd_messages.emplace_back(param);
+
+        if (params.Get_value("heading", heading)) {
+            Generate_wp_from_current_position();
+            // we have heading specified. turn first.
+            auto cmd_mission_item = mavlink::Pld_mission_item::Create();
+            Fill_target_ids(*cmd_mission_item);
+            (*cmd_mission_item)->current = 2;
+            (*cmd_mission_item)->frame = mavlink::MAV_FRAME_GLOBAL_RELATIVE_ALT;
+            (*cmd_mission_item)->autocontinue = 1;
+            (*cmd_mission_item)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_YAW;
+            // yaw angle
+            (*cmd_mission_item)->param1 = std::isnan(heading)?0:heading * 180.0 / M_PI;
+            // Use default angular speed (AUTO_YAW_SLEW_RATE == 60 deg/s)
+            (*cmd_mission_item)->param2 = 0;
+            // absolute angle
+            (*cmd_mission_item)->param4 = 0;
+            cmd_messages.emplace_back(cmd_mission_item);
+        }
+    }
+
+    auto cmd_mission_item = mavlink::Pld_mission_item::Create();
+    Fill_target_ids(*cmd_mission_item);
+    (*cmd_mission_item)->current = 2;
+    (*cmd_mission_item)->frame = mavlink::MAV_FRAME_GLOBAL_RELATIVE_ALT;
+    (*cmd_mission_item)->autocontinue = 1;
+    (*cmd_mission_item)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
+    (*cmd_mission_item)->param1 = 0; // hold time
+    (*cmd_mission_item)->param2 = acceptance_radius; // acct radius
+    (*cmd_mission_item)->param3 = 0; // passby radius
+    (*cmd_mission_item)->param4 = std::isnan(heading)?0:heading * 180.0 / M_PI;
+    (*cmd_mission_item)->x = latitude * 180.0 / M_PI;
+    (*cmd_mission_item)->y = longitude * 180.0 / M_PI;
+    (*cmd_mission_item)->z = altitude_amsl - altitude_origin;
+    cmd_messages.emplace_back(cmd_mission_item);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_guided()
+{
+    Stop_camera_series();
+    // Enter GUIDED mode.
+    ardu_vehicle.Stop_rc_override();
+    auto cmd_set_mode = mavlink::Pld_set_mode::Create();
+    (*cmd_set_mode)->target_system = vehicle.real_system_id;
+    (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+    (*cmd_set_mode)->custom_mode = Get_custom_guided_mode();
+    cmd_messages.emplace_back(cmd_set_mode);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_land()
+{
+    Stop_camera_series();
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LAND;
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_joystick()
+{
+    if (vehicle.Is_control_mode(proto::CONTROL_MODE_JOYSTICK)) {
+        Disable_success();
+    } else {
+        // Set vehicle in manual mode and start pushing RC_CHANNELS_OVERRIDE messages.
+        auto cmd_set_mode = mavlink::Pld_set_mode::Create();
+        Fill_target_system_id(*cmd_set_mode);
+        (*cmd_set_mode)->base_mode = mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+        (*cmd_set_mode)->custom_mode = Get_custom_manual_mode();
+        cmd_messages.emplace_back(cmd_set_mode);
+    }
+    ardu_vehicle.Start_rc_override();
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_direct_vehicle_control(const Property_list& params)
+{
+    if (!vehicle.Is_control_mode(proto::CONTROL_MODE_JOYSTICK)) {
+        return;
+    }
+
+    Stop_camera_series();
+
+    float pitch, yaw, roll, throttle;
+    params.at("pitch")->Get_value(pitch);
+    params.at("yaw")->Get_value(yaw);
+    params.at("roll")->Get_value(roll);
+    params.at("throttle")->Get_value(throttle);
+
+    //        LOG("Direct Vehicle (rpyt) %1.3f %1.3f %1.3f %1.3f",
+    //            roll,
+    //            pitch,
+    //            yaw,
+    //            throttle);
+
+    ardu_vehicle.direct_vehicle_control_last_received = std::chrono::steady_clock::now();
+
+    // Normalize axes depending on vehicle type.
+    if (ardu_vehicle.Is_copter()) {
+        pitch = -pitch;         // pitch is reversed for copter.
+        yaw = yaw * 0.4;    // yaw on copter is too sensitive.
+    } else {
+        yaw = -yaw;     // yaw is reversed for plane.
+    }
+
+    ardu_vehicle.Set_rc_override(
+        (roll * 500.0) + 1500,
+        (pitch * 500.0) + 1500,
+        (throttle * 500.0) + 1500,
+        (yaw * 500.0) + 1500);
+    ardu_vehicle.Send_rc_override();
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_write_parameter(const Property_list& params)
+{
+    float value;
+    std::string name;
+    if (params.Get_value("name", name) && params.Get_value("value", value)) {
+        auto param = mavlink::Pld_param_set::Create();
+        Fill_target_ids(*param);
+        (*param)->param_id = name;
+        (*param)->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+        (*param)->param_value = value;
+        cmd_messages.emplace_back(param);
+    } else {
+        // Ardupilot supports only float values as parameters.
+        // Ints and doubles are cast implicitly.
+        VSM_EXCEPTION(Invalid_param_exception, "Parameter not a numeric value");
+    }
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_rth()
+{
+    Stop_camera_series();
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    (*cmd_long)->target_component = mavlink::MAV_COMPONENT::MAV_COMP_ID_SYSTEM_CONTROL;
+    (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_NAV_RETURN_TO_LAUNCH;
+    cmd_messages.emplace_back(cmd_long);
+}
+
+void
+Ardupilot_vehicle::Vehicle_command_act::Process_camera_trigger()
+{
+    auto cmd_long = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd_long);
+    if (ardu_vehicle.camera_servo_idx == -1) {
+        (*cmd_long)->command = mavlink::MAV_CMD_DO_DIGICAM_CONTROL;
+        (*cmd_long)->param5 = 1;
+    } else {
+        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
+        (*cmd_long)->param1 = ardu_vehicle.camera_servo_idx;
+        (*cmd_long)->param2 = ardu_vehicle.camera_servo_pwm;
+        (*cmd_long)->param3 = 1;  // do it once
+        (*cmd_long)->param4 = ardu_vehicle.camera_servo_time;
+    }
+    cmd_messages.emplace_back(cmd_long);
 }
 
 void
 Ardupilot_vehicle::Vehicle_command_act::Disable_success()
 {
-    if (vehicle_command_request) {
-        vehicle_command_request.Succeed();
-    }
     if (ucs_request) {
         vehicle.Command_succeeded(ucs_request);
         ucs_request = nullptr;
@@ -1599,8 +2021,10 @@ Ardupilot_vehicle::Vehicle_command_act::Disable_success()
 }
 
 void
-Ardupilot_vehicle::Vehicle_command_act::Disable(const std::string& status)
+Ardupilot_vehicle::Vehicle_command_act::On_disable()
 {
+    cmd_messages.clear();
+
     Unregister_mavlink_handlers();
     Unregister_status_text();
 
@@ -1608,16 +2032,6 @@ Ardupilot_vehicle::Vehicle_command_act::Disable(const std::string& status)
         timer->Cancel();
         timer = nullptr;
     }
-
-    if (vehicle_command_request) {
-        vehicle_command_request.Fail(status);
-    }
-    if (ucs_request) {
-        vehicle.Command_failed(ucs_request, status);
-        ucs_request = nullptr;
-    }
-
-    Ardupilot_activity::Disable();
 }
 
 void
@@ -1661,54 +2075,35 @@ Ardupilot_vehicle::Vehicle_command_act::Unregister_status_text()
 }
 
 uint32_t
-Ardupilot_vehicle::Vehicle_command_act::Get_custom_auto_mode()
-{
-    switch (ardu_vehicle.Get_type()) {
-    case Type::COPTER:
-        return static_cast<uint32_t>(Copter_flight_mode::AUTO);
-    case Type::PLANE:
-        return static_cast<uint32_t>(Plane_flight_mode::AUTO);
-    case Type::ROVER:
-        return static_cast<uint32_t>(Rover_flight_mode::AUTO);
-    case Type::OTHER:
-        break;
-    }
-    VSM_EXCEPTION(Internal_error_exception,
-            "Unsupported type %d of vehicle in custom auto mode.", ardu_vehicle.Get_type());
-}
-
-uint32_t
 Ardupilot_vehicle::Vehicle_command_act::Get_custom_manual_mode()
 {
-    switch (ardu_vehicle.Get_type()) {
-    case Type::COPTER:
+    switch (ardu_vehicle.Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_HELICOPTER:
         return static_cast<uint32_t>(Copter_flight_mode::LOITER);
-    case Type::PLANE:
+    case proto::VEHICLE_TYPE_FIXED_WING:
+    case proto::VEHICLE_TYPE_VTOL:
         return static_cast<uint32_t>(Plane_flight_mode::STABILIZE);
-    case Type::ROVER:
+    case proto::VEHICLE_TYPE_GROUND:
         return static_cast<uint32_t>(Rover_flight_mode::MANUAL);
-    case Type::OTHER:
-        break;
     }
-    VSM_EXCEPTION(Internal_error_exception,
-            "Unsupported type %d of vehicle in custom manual mode.", ardu_vehicle.Get_type());
+    VSM_EXCEPTION(Internal_error_exception, "Undefined vehicle type");
 }
 
 uint32_t
 Ardupilot_vehicle::Vehicle_command_act::Get_custom_guided_mode()
 {
-    switch (ardu_vehicle.Get_type()) {
-    case Type::COPTER:
+    switch (ardu_vehicle.Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_HELICOPTER:
         return static_cast<uint32_t>(Copter_flight_mode::GUIDED);
-    case Type::PLANE:
+    case proto::VEHICLE_TYPE_FIXED_WING:
+    case proto::VEHICLE_TYPE_VTOL:
         return static_cast<uint32_t>(Plane_flight_mode::GUIDED);
-    case Type::ROVER:
+    case proto::VEHICLE_TYPE_GROUND:
         return static_cast<uint32_t>(Rover_flight_mode::GUIDED);
-    case Type::OTHER:
-        break;
     }
-    VSM_EXCEPTION(Internal_error_exception,
-            "Unsupported type %d of vehicle in custom manual mode.", ardu_vehicle.Get_type());
+    VSM_EXCEPTION(Internal_error_exception, "Undefined vehicle type");
 }
 
 bool
@@ -1760,19 +2155,137 @@ Ardupilot_vehicle::Vehicle_command_act::Is_Outside_Polygon(
     return outside;
 }
 
-void
-Ardupilot_vehicle::Task_upload::Enable(Vehicle_task_request::Handle request)
+Geodetic_tuple
+Ardupilot_vehicle::Task_upload::Create_geodetic_tuple(const Property_list& params)
 {
-    this->request = request;
+    double lat, lon, alt;
+    params.Get_value("latitude", lat);
+    params.Get_value("longitude", lon);
+    params.Get_value("altitude_amsl", alt);
+    return Geodetic_tuple(lat, lon, alt - altitude_origin);
+}
 
-    if (ardu_vehicle.send_home_position_as_mav_cmd) {
-        // HL altitude becomes altitude origin.
-        // Need to set at the very beginning as it is used to specify safe_altitude, too.
-        request->Set_takeoff_altitude(request->Get_home_position_altitude());
+void
+Ardupilot_vehicle::Task_upload::Preprocess_mission(const proto::Device_command& vsm_cmd)
+{
+    auto route_params = vehicle.c_mission_upload->Build_parameter_list(vsm_cmd);
+    std::string route_name;
+    if (route_params.Get_value("name", route_name)) {
+        VEHICLE_LOG_INF(vehicle, "Route name : %s", route_name.c_str());
     }
 
-    Filter_actions();
-    Prepare_task_attributes();
+    if (!route_params.Get_value("altitude_origin", altitude_origin)) {
+        VSM_EXCEPTION(Invalid_param_exception, "Altitude origin not present in route");
+    }
+
+    if (!route_params.Get_value("safe_altitude", safe_altitude)) {
+        VSM_EXCEPTION(Invalid_param_exception, "safe_altitude not present in route");
+    }
+
+    bool takeoff_present = false;
+
+    // Prepare_takeoff_mission uses this feature.
+    current_route_command_index = 0;
+
+    for (int i = 0; i < vsm_cmd.sub_commands_size(); i++) {
+        auto vsm_scmd = vsm_cmd.sub_commands(i);
+        auto cmd = vehicle.Get_command(vsm_scmd.command_id());
+        if (cmd) {
+            if (!cmd->Is_mission_item()) {
+                VSM_EXCEPTION(
+                    Invalid_param_exception,
+                    "Command %s not supported in route",
+                    cmd->Get_name().c_str());
+            }
+            VEHICLE_LOG_INF(vehicle, "ROUTE item %s", vehicle.Dump_command(vsm_scmd).c_str());
+            vehicle.current_command_map.Set_current_command(current_route_command_index);
+            auto params = cmd->Build_parameter_list(vsm_scmd);
+            if (cmd == vehicle.c_set_home) {
+                float alt;
+                if (params.Get_value("altitude_amsl", alt)) {
+                    if (ardu_vehicle.send_home_position_as_mav_cmd) {
+                        // HL altitude becomes altitude origin.
+                        // Need to set at the very beginning as it is used to specify safe_altitude, too.
+                        altitude_origin = alt;
+                        VEHICLE_LOG_INF(vehicle, "Using HL altitude %f as altitude origin", altitude_origin);
+                    }
+                    home_altitude = alt;
+                }
+                hl_params = params;
+
+                /* Ardupilot waypoint at index zero is always treated as home position,
+                 * so ensure it is always present. In other words, real waypoint should not
+                 * be stored at zero index.
+                 */
+                Prepare_set_home(params);
+
+                if (takeoff_present) {
+                    VSM_EXCEPTION(Invalid_param_exception, "SET_HOME must appear before any WP");
+                }
+            } else if (cmd == vehicle.c_takeoff_mission) {
+                takeoff_present = true;
+            } else if (cmd == vehicle.c_set_parameter) {
+                // For now used only by arduplane params ("LANDING_FLARE_TIME" and friends)
+                Prepare_set_parameters(params);
+            } else if (cmd == vehicle.c_move) {
+                takeoff_present = true;
+            }
+        } else {
+            VSM_EXCEPTION(Invalid_param_exception, "Unregistered route item %d", vsm_scmd.command_id());
+        }
+        current_route_command_index++;
+    }
+
+    // This must come after home_altitude and altitude_origin is set.
+    Prepare_task_attributes(route_params);
+}
+
+void
+Ardupilot_vehicle::Task_upload::On_download_progress(int seqnum)
+{
+    // report progress only on each 10th item
+    if ((seqnum % 10 == 0) && seqnum > 0) {
+        vehicle.Report_progress(ucs_request, (command_count + param_count + item_count + seqnum) / total_count);
+    }
+}
+
+void
+Ardupilot_vehicle::Task_upload::On_upload_progress(int seqnum)
+{
+    // report progress only on each 10th item
+    if ((seqnum % 10 == 0) && seqnum > 0) {
+        vehicle.Report_progress(ucs_request, (command_count + param_count + seqnum) / total_count);
+    }
+}
+
+void
+Ardupilot_vehicle::Task_upload::Enable()
+{
+    // Clean state.
+    prepared_actions.clear();
+    task_attributes.clear();
+    hl_params.clear();
+    last_move_params.Disengage();
+    current_mission_poi.Disengage();
+    current_mission_heading.Disengage();
+    first_mission_poi_set = false;
+    restart_mission_poi = false;
+    // Initialize to something out of range to force autoheading (if enabled) after first WP.
+    current_heading = 1000;
+    heading_to_this_wp = 1000; // must be equal to current_heading for Prepare_move autoheading logic.
+    current_speed = -1;
+    camera_series_by_dist_active = false;
+    camera_series_by_dist_active_in_wp = false;
+    camera_series_by_time_active = false;
+    camera_series_by_time_active_in_wp = false;
+    altitude_origin = 0;
+    safe_altitude = 0;
+    home_altitude = 0;
+    current_route_command_index = -1;
+    command_count = 0;
+    item_count = 0;
+    param_count = 0;
+    total_count = 0;
 
     // Use GND_ALT_OFFSET to calibrate amsl altitude on mission upload.
     // Do this when uploading on ardupilot versions => 3.4.0
@@ -1784,7 +2297,9 @@ Ardupilot_vehicle::Task_upload::Enable(Vehicle_task_request::Handle request)
                         &Task_upload::Upload_parameters,
                         this));
         vehicle.read_parameters.Enable({"GND_ALT_OFFSET"});
+        command_count = 1;
     } else {
+        command_count = 0;
         Upload_parameters(true, "");
     }
 }
@@ -1793,6 +2308,27 @@ void
 Ardupilot_vehicle::Task_upload::Upload_parameters(bool success, std::string error_msg)
 {
     if (success) {
+        auto &vsm_cmd = ucs_request->request.device_commands(0);
+
+        vehicle.current_command_map.Reset();
+        vehicle.current_route.Reset();
+
+        try {
+            Preprocess_mission(vsm_cmd);
+            Prepare_mission(vsm_cmd);
+        } catch (Invalid_param_exception &e) {
+            Disable(e.what());
+            return;
+        }
+        param_count = task_attributes.size();
+        item_count = prepared_actions.size();
+
+        total_count = command_count + param_count + (item_count * 2);
+
+        if (command_count) {
+            vehicle.Report_progress(ucs_request, command_count / total_count);
+        }
+
         vehicle.write_parameters.Disable();
         vehicle.write_parameters.Set_next_action(
                 Write_parameters::Make_next_action(
@@ -1801,72 +2337,62 @@ Ardupilot_vehicle::Task_upload::Upload_parameters(bool success, std::string erro
         vehicle.write_parameters.Enable(task_attributes);
     } else {
         if (error_msg.size()) {
-            request.Fail(error_msg);
+            Disable(error_msg);
         } else {
-            request.Fail("Could not read GND_ALT_OFFSET");
+            Disable("Could not read GND_ALT_OFFSET");
         }
-        Disable();
     }
 }
 
 void
 Ardupilot_vehicle::Task_upload::Task_atributes_uploaded(bool success, std::string error_msg)
 {
-    if (!success) {
-        if (error_msg.size()) {
-            request.Fail(error_msg);
+    if (success) {
+        if (ardu_vehicle.send_home_position_as_mav_cmd) {
+            vehicle.do_commands.Disable();
+            vehicle.do_commands.Set_next_action(
+                    Activity::Make_next_action(
+                            &Task_upload::Task_commands_sent,
+                            this));
+
+            auto cmd = Create_command_long_with_coords(hl_params);
+            (*cmd)->param7 = (*cmd)->param7 + altitude_origin;
+            (*cmd)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_HOME;
+            vehicle.do_commands.Enable({*cmd});
         } else {
-            request.Fail("Task attributes upload failed");
+            Task_commands_sent(true);
         }
-        Disable();
-        return;
-    }
-
-    if (ardu_vehicle.send_home_position_as_mav_cmd) {
-        vehicle.do_commands.Disable();
-        vehicle.do_commands.Set_next_action(
-                Activity::Make_next_action(
-                        &Task_upload::Task_commands_sent,
-                        this));
-
-        mavlink::Pld_command_long cmd;
-        auto hl = request->Get_home_position().Get_geodetic();
-        cmd->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_HOME;
-        cmd->param1 = 0; // use specified.
-        cmd->param5 = hl.latitude * 180 / M_PI;
-        cmd->param6 = hl.longitude * 180 / M_PI;
-        cmd->param7 = hl.altitude;
-        vehicle.do_commands.Enable({cmd});
     } else {
-        Task_commands_sent(true);
+        if (error_msg.size()) {
+            Disable(error_msg);
+        } else {
+            Disable("Task attributes upload failed");
+        }
     }
 }
 
 void
 Ardupilot_vehicle::Task_upload::Task_commands_sent(bool success, std::string)
 {
-    if (!success) {
-        request.Fail("Failed to set home location");
-        Disable();
-        return;
+    if (success) {
+        // New home location should be set by now.
+        // invalidate current home location and timer handler will retrieve it again.
+        ardu_vehicle.home_location.longitude = 0;
+        ardu_vehicle.home_location.latitude = 0;
+
+        // Invalidate the current mission_id.
+        vehicle.t_current_mission_id->Set_value_na();
+
+        vehicle.Report_progress(ucs_request, (command_count + param_count) / total_count);
+
+        vehicle.mission_upload.Disable();
+        vehicle.mission_upload.mission_items = std::move(prepared_actions);
+        vehicle.mission_upload.Set_next_action(
+                Activity::Make_next_action(&Task_upload::Mission_uploaded, this));
+        vehicle.mission_upload.Enable();
+    } else {
+        Disable("Failed to set home location");
     }
-
-    // New home location should be set by now.
-    // invalidate current home location and timer handler will retrieve it again.
-    ardu_vehicle.home_location.longitude = 0;
-    ardu_vehicle.home_location.latitude = 0;
-
-    // Invalidate the current mission_id.
-    vehicle.t_current_mission_id->Set_value_na();
-
-    Prepare_task();
-    vehicle.mission_upload.Disable();
-    vehicle.mission_upload.mission_items = std::move(prepared_actions);
-    vehicle.mission_upload.Set_next_action(
-            Activity::Make_next_action(
-                    &Task_upload::Mission_uploaded,
-                    this));
-    vehicle.mission_upload.Enable();
 }
 
 void
@@ -1876,19 +2402,23 @@ Ardupilot_vehicle::Task_upload::Mission_uploaded(bool success, std::string error
         LOG("Mission uploaded");
         // Download the route to generate mission_id (hash) so that it will
         // be exactly the same when we download the mission next time.
-        vehicle.read_waypoints.Disable();
-        vehicle.read_waypoints.Set_next_action(
-                Activity::Make_next_action(
-                        &Task_upload::Mission_downloaded,
-                        this));
-        vehicle.read_waypoints.Enable();
+        if (ardu_vehicle.disable_mission_download) {
+            vehicle.Command_succeeded(ucs_request);
+            ucs_request = nullptr;
+        } else {
+            vehicle.read_waypoints.Disable();
+            vehicle.read_waypoints.Set_next_action(
+                    Activity::Make_next_action(
+                            &Task_upload::Mission_downloaded,
+                            this));
+            vehicle.read_waypoints.Enable();
+        }
     } else {
         if (error_msg.size()) {
-            request.Fail(error_msg);
+            Disable(error_msg);
         } else {
-            request.Fail("Route upload failed");
+            Disable("Route upload failed");
         }
-        Disable();
     }
 }
 
@@ -1899,17 +2429,16 @@ Ardupilot_vehicle::Task_upload::Mission_downloaded(bool success, std::string err
         LOG("Verified mission_id=%08X", vehicle.current_command_map.Get_route_id());
         vehicle.t_current_mission_id->Set_value(vehicle.current_command_map.Get_route_id());
         // Populate the command_map in response.
-        vehicle.current_command_map.Fill_command_mapping_response(request->ucs_response);
-        request.Succeed();
-    } else {
-        if (error_msg.size()) {
-            vehicle.Add_status_message(error_msg);
-            request.Fail(error_msg);
-        } else {
-            request.Fail("Route verification failed");
-        }
+        vehicle.current_command_map.Fill_command_mapping_response(ucs_request->response);
+        vehicle.Command_succeeded(ucs_request);
+        ucs_request = nullptr;
     }
-    Disable();
+    if (error_msg.size()) {
+        vehicle.Add_status_message(error_msg);
+        Disable(error_msg);
+    } else {
+        Disable("Route upload failed");
+    }
 }
 
 void
@@ -1922,8 +2451,57 @@ Ardupilot_vehicle::Task_upload::Fill_mavlink_mission_item_coords(
     /* Fixup absolute altitude - make them relative to
      * take-off altitude.
      */
-    msg->z = tuple.altitude - request->Get_takeoff_altitude();
+    msg->z = tuple.altitude - altitude_origin;
     msg->param4 = (heading * 180.0) / M_PI;
+}
+
+mavlink::Pld_mission_item::Ptr
+Ardupilot_vehicle::Task_upload::Create_mission_item()
+{
+    auto mi = mavlink::Pld_mission_item::Create();
+    return mi;
+}
+
+mavlink::Pld_mission_item::Ptr
+Ardupilot_vehicle::Task_upload::Create_mission_item_with_coords(const Property_list& params)
+{
+    auto mi = Create_mission_item();
+    double tmp;
+    if (params.Get_value("latitude", tmp)) {
+        (*mi)->x = tmp * 180 / M_PI;
+    }
+    if (params.Get_value("longitude", tmp)) {
+        (*mi)->y = tmp * 180 / M_PI;
+    }
+    if (params.Get_value("altitude_amsl", tmp)) {
+        (*mi)->z = tmp - altitude_origin;
+    }
+    if (params.Get_value("heading", tmp)) {
+        (*mi)->param4 = tmp * 180 / M_PI;
+    }
+    return mi;
+}
+
+mavlink::Pld_command_long::Ptr
+Ardupilot_vehicle::Task_upload::Create_command_long_with_coords(
+    const Property_list& params)
+{
+    auto cmd = mavlink::Pld_command_long::Create();
+    Fill_target_ids(*cmd);
+    double tmp;
+    if (params.Get_value("heading", tmp)) {
+        (*cmd)->param4 = tmp * 180 / M_PI;
+    }
+    if (params.Get_value("latitude", tmp)) {
+        (*cmd)->param5 = tmp * 180 / M_PI;
+    }
+    if (params.Get_value("longitude", tmp)) {
+        (*cmd)->param6 = tmp * 180 / M_PI;
+    }
+    if (params.Get_value("altitude_amsl", tmp)) {
+        (*cmd)->param7 = tmp - altitude_origin;
+    }
+    return cmd;
 }
 
 void
@@ -1947,14 +2525,13 @@ Ardupilot_vehicle::Task_upload::Fill_mavlink_mission_item_common(
 void
 Ardupilot_vehicle::Task_upload::On_disable()
 {
-    request.Fail("Upload canceled");
     vehicle.write_parameters.Disable();
     vehicle.mission_upload.Disable();
     prepared_actions.clear();
     task_attributes.clear();
     current_mission_poi.Disengage();
     current_mission_heading.Disengage();
-    last_move_action = nullptr;
+    last_move_params.Disengage();
     first_mission_poi_set = false;
     restart_mission_poi = false;
     current_heading = 0;
@@ -1962,352 +2539,241 @@ Ardupilot_vehicle::Task_upload::On_disable()
 }
 
 void
-Ardupilot_vehicle::Task_upload::Filter_actions()
+Ardupilot_vehicle::Task_upload::Prepare_mission(const proto::Device_command& vsm_cmd)
 {
-    switch (ardu_vehicle.Get_type()) {
-    case Type::COPTER:
-        Filter_copter_actions();
-        return;
-    case Type::PLANE:
-        Filter_plane_actions();
-        return;
-    case Type::ROVER:
-        Filter_rover_actions();
-        return;
-    case Type::OTHER:
-        Filter_other_actions();
-        return;
-    }
-    VSM_EXCEPTION(Internal_error_exception, "Unhandled Ardupilot vehicle type %d.",
-            ardu_vehicle.Get_type());
-}
-
-void
-Ardupilot_vehicle::Task_upload::Filter_copter_actions()
-{
-    for (auto iter = request->actions.begin(); iter != request->actions.end();) {
-        switch ((*iter)->Get_type()) {
-        case Action::Type::CAMERA_CONTROL:
-            VEHICLE_LOG_WRN(vehicle, "CAMERA_CONTROL action ignored.");
-            break;
-        case Action::Type::CAMERA_TRIGGER:
-            VEHICLE_LOG_WRN(vehicle, "CAMERA_TRIGGER action ignored.");
-            break;
-        default:
-            iter++;
-            continue;
-        }
-        iter = request->actions.erase(iter);
-    }
-}
-
-void
-Ardupilot_vehicle::Task_upload::Filter_plane_actions()
-{
-    for (auto iter = request->actions.begin(); iter != request->actions.end();) {
-        switch ((*iter)->Get_type()) {
-        case Action::Type::CAMERA_CONTROL:
-            VEHICLE_LOG_WRN(vehicle, "CAMERA_CONTROL action ignored.");
-            break;
-        case Action::Type::CAMERA_TRIGGER:
-            VEHICLE_LOG_WRN(vehicle, "CAMERA_TRIGGER action ignored.");
-            break;
-        case Action::Type::PANORAMA:
-            VEHICLE_LOG_WRN(vehicle, "PANORAMA action ignored.");
-            break;
-        case Action::Type::POI:
-            VEHICLE_LOG_WRN(vehicle, "POI action ignored.");
-            break;
-        case Action::Type::HEADING:
-            VEHICLE_LOG_WRN(vehicle, "HEADING action ignored.");
-            break;
-        default:
-            iter++;
-            continue;
-        }
-        iter = request->actions.erase(iter);
-    }
-}
-
-void
-Ardupilot_vehicle::Task_upload::Filter_rover_actions()
-{
-    for (auto iter = request->actions.begin(); iter != request->actions.end();) {
-        switch ((*iter)->Get_type()) {
-        case Action::Type::CAMERA_CONTROL:
-            VEHICLE_LOG_WRN(vehicle, "CAMERA_CONTROL action ignored.");
-            break;
-        case Action::Type::CAMERA_TRIGGER:
-            VEHICLE_LOG_WRN(vehicle, "CAMERA_TRIGGER action ignored.");
-            break;
-        case Action::Type::PANORAMA:
-            VEHICLE_LOG_WRN(vehicle, "PANORAMA action ignored.");
-            break;
-        case Action::Type::POI:
-            VEHICLE_LOG_WRN(vehicle, "POI action ignored.");
-            break;
-        case Action::Type::HEADING:
-            VEHICLE_LOG_WRN(vehicle, "HEADING action ignored.");
-            break;
-        default:
-            iter++;
-            continue;
-        }
-        iter = request->actions.erase(iter);
-    }
-}
-
-void
-Ardupilot_vehicle::Task_upload::Filter_other_actions()
-{
-    /* Only move is supported. Safe. */
-    for (auto iter = request->actions.begin(); iter != request->actions.end();) {
-        switch ((*iter)->Get_type()) {
-        case Action::Type::MOVE:
-            iter++;
-            continue;
-        default:
-            VEHICLE_LOG_WRN(vehicle, "Action type %d ignored.", static_cast<int>((*iter)->Get_type()));
-            break;
-        }
-        iter = request->actions.erase(iter);
-    }
-}
-
-void
-Ardupilot_vehicle::Task_upload::Prepare_task()
-{
-    prepared_actions.clear();
-    vehicle.current_command_map.Reset();
-    vehicle.current_route.Reset();
-
-    /* Ardupilot waypoint at index zero is always treated as home position,
-     * so ensure it is always present. In other words, real waypoint should not
-     * be stored at zero index.
-     */
-    Set_home_action::Ptr set_home_action = Set_home_action::Create(
-            false /* use specified. */,
-            request->Get_home_position(),
-            0 /* elevation. */);
-
-    Prepare_action(set_home_action);
-
-    bool first_set_home_found = false;
-    bool takeoff_added = false;
-
-    last_move_action = nullptr;
-    for (auto& iter : request->actions) {
-        vehicle.current_command_map.Set_current_command(iter->command_id);
-        switch (iter->Get_type()) {
-        case Action::Type::TAKEOFF:
-            takeoff_added = true;
-            break;
-        case Action::Type::MOVE:
-            if (!takeoff_added) {
+    last_move_params.Disengage();
+    current_route_command_index = 0;
+    auto takeoff_present = false;
+    for (int i = 0; i < vsm_cmd.sub_commands_size(); i++) {
+        auto vsm_scmd = vsm_cmd.sub_commands(i);
+        auto cmd = vehicle.Get_command(vsm_scmd.command_id());
+        vehicle.current_command_map.Set_current_command(current_route_command_index);
+        auto params = cmd->Build_parameter_list(vsm_scmd);
+        if (cmd == vehicle.c_takeoff_mission) {
+            Prepare_takeoff_mission(params);
+            /* Ardupilot does not fly to the takeoff position after takeoff
+             * is done. Add explicit waypoint after the takeoff command with
+             * target coordinates.
+             */
+            Prepare_move(params);
+            takeoff_present = true;
+        } else if (cmd == vehicle.c_land_mission) {
+            Prepare_landing(params);
+        } else if (cmd == vehicle.c_move) {
+            if (!takeoff_present) {
                 // First WP found without prior takeoff action.
                 // Insert takeoff action on first WP.
                 // Required for ArduCopter 3.4+ otherwise it fails AUTO command.
-                auto to = iter->Get_action<Action::Type::MOVE>();
                 VEHICLE_LOG_WRN(vehicle, "Auto-adding TAKEOFF action before 1st WP");
-                mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-                if (ardu_vehicle.vtol_plane) {
-                    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_VTOL_TAKEOFF;
-                } else {
-                    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_TAKEOFF;
-                }
-                (*mi)->param1 = 0; /* No data for pitch. */
-                Fill_mavlink_mission_item_coords(*mi, to->position.Get_geodetic(), to->heading);
-                Add_mission_item(mi);
-                takeoff_added = true;
+                Prepare_takeoff_mission(params);
+                takeoff_present = true;
             }
-            break;
-        case Action::Type::SET_HOME:
-            if (!first_set_home_found) {
-                /* Skip first set_home, it has been already processed and put
-                 * into waypoint index zero. */
-                first_set_home_found = true;
-                continue;
-            }
-            break;
-        default:
-            break;
+            Prepare_move(params);
+        } else if (cmd == vehicle.c_set_speed) {
+            Prepare_change_speed(params);
+        } else if (cmd == vehicle.c_wait) {
+            Prepare_wait(params);
+        } else if (cmd == vehicle.c_set_heading) {
+            Prepare_heading(params);
+        } else if (cmd == vehicle.c_panorama) {
+            Prepare_panorama(params);
+        } else if (cmd == vehicle.c_set_poi) {
+            Prepare_poi(params);
+        } else if (cmd == vehicle.c_camera_trigger_mission) {
+            Prepare_camera_trigger(params);
+        } else if (cmd == vehicle.c_repeat_servo) {
+            Prepare_repeat_servo(params);
+        } else if (cmd == vehicle.c_set_servo) {
+            Prepare_set_servo(params);
+        } else if (cmd == vehicle.c_camera_by_distance) {
+            Prepare_camera_series_by_distance(params);
+        } else if (cmd == vehicle.c_camera_by_time) {
+            Prepare_camera_series_by_time(params);
+        } else if (cmd == vehicle.c_transition_fixed) {
+            Prepare_vtol_transition(false);
+        } else if (cmd == vehicle.c_transition_vtol) {
+            Prepare_vtol_transition(true);
+        } else if (cmd == vehicle.c_wait_until) {
+            Prepare_wait_until(params);
+        } else if (cmd == vehicle.c_payload_control) {
+            Prepare_payload_control(params);
         }
-        Prepare_action(iter);
+        current_route_command_index++;
     }
-
-    if (last_move_action) {
-        Prepare_action(last_move_action);
+    if (last_move_params) {
+        // Force stopping of camera series even if it's started in the last WP.
+        camera_series_by_dist_active_in_wp = false;
+        camera_series_by_time_active_in_wp = false;
+        Stop_camera_series();
     }
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_task_attributes()
-{
-    task_attributes.clear();
-    if (request->attributes == nullptr) {
-        return;
-    }
-    switch (ardu_vehicle.Get_type()) {
-    case Type::COPTER:
-        Prepare_copter_task_attributes();
-        return;
-    case Type::PLANE:
-        Prepare_plane_task_attributes();
-        return;
-    case Type::ROVER:
-        Prepare_rover_task_attributes();
-        return;
-    case Type::OTHER:
-        Prepare_other_task_attributes();
-        return;
-    }
-    VSM_EXCEPTION(Internal_error_exception, "Unhandled Ardupilot vehicle type %d",
-            ardu_vehicle.Get_type());
-}
-
-void
-Ardupilot_vehicle::Task_upload::Prepare_copter_task_attributes()
+Ardupilot_vehicle::Task_upload::Prepare_task_attributes(const Property_list& params)
 {
     mavlink::Pld_param_set param;
     Fill_target_ids(param);
-    using Emerg = Task_attributes_action::Emergency_action;
 
-    // Use GND_ALT_OFFSET to calibrate amsl altitude on mission upload.
-    // Do this when uploading
-    float current_alt;
-    bool armed = true;
-    if (    vehicle.t_altitude_amsl->Get_value(current_alt)
-        &&  vehicle.t_is_armed->Get_value(armed)
-        &&  !armed
-        &&  ardu_vehicle.gnd_alt_offset_allow)
-    {
-        param->param_id = "GND_ALT_OFFSET";
-        param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
-        if (ardu_vehicle.set_ground_alt_offset) {
-            float hl_alt = request->Get_home_position_altitude();
-            param->param_value = (hl_alt - current_alt) + ardu_vehicle.current_alt_offset;
-        } else {
-            param->param_value = 0;
+    if ( vehicle.Is_copter() ||
+         vehicle.Get_vehicle_type() == proto::VEHICLE_TYPE_FIXED_WING ||
+         vehicle.Get_vehicle_type() == proto::VEHICLE_TYPE_VTOL) {
+        // Use GND_ALT_OFFSET to calibrate amsl altitude on mission upload.
+        // Do this when uploading
+        float current_alt;
+        bool armed = true;
+        if (    vehicle.t_altitude_amsl->Get_value(current_alt)
+            &&  vehicle.t_is_armed->Get_value(armed)
+            &&  !armed
+            &&  ardu_vehicle.gnd_alt_offset_allow)
+        {
+            param->param_id = "GND_ALT_OFFSET";
+            param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
+            if (ardu_vehicle.set_ground_alt_offset && ardu_vehicle.current_alt_offset) {
+                // calibrate based on current altitude.
+                param->param_value = (home_altitude - current_alt) + *ardu_vehicle.current_alt_offset;
+            } else {
+                // reset calibration
+                param->param_value = 0;
+            }
+            param->param_value = (home_altitude - current_alt) + *ardu_vehicle.current_alt_offset;
+            task_attributes.push_back(param);
         }
-        task_attributes.push_back(param);
-    }
-    if (request->attributes->low_battery != Emerg::DO_NOT_CHANGE) {
-        /* Battery failsafe. */
-        param->param_id = "FS_BATT_ENABLE";
+
+        param->param_id = "CAM_TRIGG_TYPE";
         param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-        switch (request->attributes->low_battery) {
-        case Emerg::GO_HOME:
-            param->param_value = 2;
-            break;
-        case Emerg::LAND:
-            param->param_value = 1;
-            break;
-        case Emerg::WAIT:
-            /* There is no support for such behavior. Override with land. */
-            param->param_value = 1;
-            break;
-        case Emerg::CONTINUE:
-            param->param_value = 0;
-            break;
-        case Emerg::DO_NOT_CHANGE:
-            LOG_WARN("Invalid FS action for low battery");
-            break;
-        }
+        param->param_value = 0; /* Servo trigger type. */
         task_attributes.push_back(param);
     }
 
-    if (request->attributes->gnss_loss != Emerg::DO_NOT_CHANGE) {
-        /* GNSS loss failsafe. */
-        if (ardu_vehicle.use_ekf_action_as_gps_failsafe) {
-            param->param_id = "FS_EKF_ACTION";
+    // Set copter specific stuff
+    if (vehicle.Is_copter()) {
+        int fs_value;
+        if (params.Get_value("low_battery_action", fs_value)) {
+            /* Battery failsafe. */
+            if (ardu_vehicle.use_batt_fs_as_batt_failsafe) {
+                param->param_id = "BATT_FS_LOW_ACT";
+            } else {
+                param->param_id = "FS_BATT_ENABLE";
+            }
             param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-            switch (request->attributes->gnss_loss) {
-            case Emerg::LAND:
+            switch (fs_value) {
+            case proto::FAILSAFE_ACTION_RTH:
+                param->param_value = 2;
+                break;
+            case proto::FAILSAFE_ACTION_LAND:
                 param->param_value = 1;
                 break;
-            case Emerg::WAIT:
-                param->param_value = 2;
+            case proto::FAILSAFE_ACTION_WAIT:
+                /* There is no support for such behavior. Override with land. */
+                param->param_value = 1;
                 break;
-            default:
-                LOG_WARN("Invalid FS action for GPS");
+            case proto::FAILSAFE_ACTION_CONTINUE:
+                param->param_value = 0;
                 break;
             }
-        } else {
-            param->param_id = "FS_GPS_ENABLE";
+            task_attributes.push_back(param);
+        }
+
+        if (params.Get_value("gps_loss_action", fs_value)) {
+            /* GNSS loss failsafe. */
+            if (ardu_vehicle.use_ekf_action_as_gps_failsafe) {
+                param->param_id = "FS_EKF_ACTION";
+                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+                switch (fs_value) {
+                case proto::FAILSAFE_ACTION_LAND:
+                    param->param_value = 1;
+                    break;
+                case proto::FAILSAFE_ACTION_WAIT:
+                    param->param_value = 2;
+                    break;
+                default:
+                    LOG_WARN("Invalid FS action for GPS");
+                    break;
+                }
+            } else {
+                param->param_id = "FS_GPS_ENABLE";
+                param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+                switch (fs_value) {
+                case proto::FAILSAFE_ACTION_LAND:
+                    param->param_value = 3;
+                    break;
+                case proto::FAILSAFE_ACTION_WAIT:
+                    param->param_value = 2;
+                    break;
+                default:
+                    LOG_WARN("Invalid FS action for GPS");
+                    break;
+                }
+            }
+            task_attributes.push_back(param);
+        }
+
+        /* Radio Control loss failsafe. */
+        if (params.Get_value("rc_loss_action", fs_value)) {
+            param->param_id = "FS_THR_ENABLE";
             param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-            switch (request->attributes->gnss_loss) {
-            case Emerg::LAND:
+            switch (fs_value) {
+            case proto::FAILSAFE_ACTION_RTH:
+                param->param_value = 1;
+                break;
+            case proto::FAILSAFE_ACTION_LAND:
                 param->param_value = 3;
                 break;
-            case Emerg::WAIT:
+            case proto::FAILSAFE_ACTION_WAIT:
+                /* Wait not supported, do land. */
+                param->param_value = 3;
+                break;
+            case proto::FAILSAFE_ACTION_CONTINUE:
+                /* Continue in auto, land in other modes. */
                 param->param_value = 2;
                 break;
-            default:
-                LOG_WARN("Invalid FS action for GPS");
-                break;
             }
+            task_attributes.push_back(param);
         }
-        task_attributes.push_back(param);
-    }
 
-    /* Radio Control loss failsafe. */
-    if (request->attributes->rc_loss != Emerg::DO_NOT_CHANGE) {
-        param->param_id = "FS_THR_ENABLE";
-        param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-        switch (request->attributes->rc_loss) {
-        case Emerg::GO_HOME:
-            param->param_value = 1;
-            break;
-        case Emerg::LAND:
-            param->param_value = 3;
-            break;
-        case Emerg::WAIT:
-            /* Wait not supported, do land. */
-            param->param_value = 3;
-            break;
-        case Emerg::CONTINUE:
-            /* Continue in auto, land in other modes. */
-            param->param_value = 2;
-            break;
-        case Emerg::DO_NOT_CHANGE:
-            LOG_WARN("Invalid FS action for RC loss");
-            break;
-        }
-        task_attributes.push_back(param);
-    }
-
-    if (std::isnan(request->attributes->safe_altitude)) {
-        VEHICLE_LOG_INF(vehicle, "Not setting RTH altitude");
-    } else {
-        int16_t safe_alt = (request->attributes->safe_altitude - request->Get_takeoff_altitude()) * 100;
-
+        int32_t safe_alt = (safe_altitude - altitude_origin) * 100;
         if (safe_alt < 100) {
             // Avoid landing.
             VEHICLE_LOG_WRN(vehicle, "Forcing safe altitude to 1m");
             safe_alt = 100;
         }
+
+        if (params.Get_value("rth_action", fs_value)) {
+            param->param_id = "RTL_ALT_FINAL";
+            param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT16;
+            float final_alt;
+            switch (fs_value) {
+            case proto::RTH_ACTION_LAND:
+                param->param_value = 0;
+                task_attributes.push_back(param);
+                break;
+            case proto::RTH_ACTION_WAIT:
+                if (params.Get_value("rth_wait_altitude", final_alt)) {
+                    param->param_value = (final_alt - altitude_origin) * 100;
+                } else {
+                    param->param_value = safe_alt;
+                }
+                break;
+            }
+        }
+
         /* RTL altitude. */
         param->param_id = "RTL_ALT";
         param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT16;
         param->param_value = safe_alt;
         task_attributes.push_back(param);
 
-        /* RTL Final altitude. Set to the same as RTL_ALT.
-         * This makes it hover after RTL. 0 would mean land.*/
-        param->param_id = "RTL_ALT_FINAL";
-        param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT16;
-        param->param_value = safe_alt;
-        task_attributes.push_back(param);
+        if (ardu_vehicle.autoheading) {
+            /* Don't change yaw during auto mission, because there is an auto-POI
+            * feature. Besides that, duplicated waypoints are used to implement
+            * actions like panorama, so it is not desirable to change the yaw while
+            * switching between waypoints sharing the same location. */
+            param->param_id = "WP_YAW_BEHAVIOR";
+            param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
+            param->param_value = 0; /* Never change yaw. */
+            task_attributes.push_back(param);
+        }
     }
-
-    /* Don't change yaw during auto mission, because there is an auto-POI
-     * feature. Besides that, duplicated waypoints are used to implement
-     * actions like panorama, so it is not desirable to change the yaw while
-     * switching between waypoints sharing the same location. */
-    param->param_id = "WP_YAW_BEHAVIOR";
-    param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_INT8;
-    param->param_value = 0; /* Never change yaw. */
-    task_attributes.push_back(param);
 
 #if 0 /* Wait until supported. */
     /* Mount control mode. */
@@ -2324,13 +2790,13 @@ Ardupilot_vehicle::Task_upload::Prepare_copter_task_attributes()
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_plane_task_attributes()
+Ardupilot_vehicle::Task_upload::Prepare_set_parameters(const Property_list& params)
 {
     /* Add plane specific task attributes */
     mavlink::Pld_param_set param;
     Fill_target_ids(param);
     float v;    // All my parameters are float.
-    for (auto & p : request->parameters) {
+    for (auto & p : params) {
         if (p.second->Get_value(v)) {
             if        (p.first == "landing_flare_altitude") {
                 param->param_id = "LAND_FLARE_ALT";
@@ -2393,76 +2859,6 @@ Ardupilot_vehicle::Task_upload::Prepare_plane_task_attributes()
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_rover_task_attributes()
-{
-    /* Add rover specific task attributes */
-}
-
-void
-Ardupilot_vehicle::Task_upload::Prepare_other_task_attributes()
-{
-    /* Stub. */
-}
-
-void
-Ardupilot_vehicle::Task_upload::Prepare_action(Action::Ptr action)
-{
-    switch (action->Get_type()) {
-    case Action::Type::MOVE:
-        Prepare_move(action);
-        return;
-    case Action::Type::WAIT:
-        Prepare_wait(action);
-        return;
-    case Action::Type::PAYLOAD_STEERING:
-        Prepare_payload_steering(action);
-        return;
-    case Action::Type::TAKEOFF:
-        Prepare_takeoff(action);
-        return;
-    case Action::Type::LANDING:
-        Prepare_landing(action);
-        return;
-    case Action::Type::CHANGE_SPEED:
-        Prepare_change_speed(action);
-        return;
-    case Action::Type::SET_HOME:
-        Prepare_set_home(action);
-        return;
-    case Action::Type::POI:
-        Prepare_POI(action);
-        return;
-    case Action::Type::HEADING:
-        Prepare_heading(action);
-        return;
-    case Action::Type::PANORAMA:
-        Prepare_panorama(action);
-        return;
-    case Action::Type::CAMERA_TRIGGER:
-        Prepare_camera_trigger(action);
-        return;
-    case Action::Type::CAMERA_SERIES_BY_TIME:
-        Prepare_camera_series_by_time(action);
-        return;
-    case Action::Type::CAMERA_SERIES_BY_DISTANCE:
-        Prepare_camera_series_by_distance(action);
-        return;
-    case Action::Type::SET_SERVO:
-        Prepare_set_servo(action);
-        return;
-    case Action::Type::REPEAT_SERVO:
-        Prepare_repeat_servo(action);
-        return;
-    case Action::Type::VTOL_TRANSITION:
-        Prepare_vtol_transition(action);
-        return;
-    default:
-        VEHICLE_LOG_ERR(vehicle, "action %s not supported.", action->Get_name().c_str());
-        break;
-    }
-}
-
-void
 Ardupilot_vehicle::Task_upload::Add_mission_item(mavlink::Pld_mission_item::Ptr mi)
 {
     Fill_mavlink_mission_item_common(*mi);
@@ -2470,38 +2866,45 @@ Ardupilot_vehicle::Task_upload::Add_mission_item(mavlink::Pld_mission_item::Ptr 
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_move(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Stop_camera_series()
 {
     /* Turn off camera series if active. */
     if (!camera_series_by_dist_active_in_wp) {
         if (camera_series_by_dist_active) {
             camera_series_by_dist_active = false;
-            Camera_series_by_distance_action::Ptr a =
-                action->Get_action<Action::Type::CAMERA_SERIES_BY_DISTANCE>();
-            mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+            auto mi = Create_mission_item();
             (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_CAM_TRIGG_DIST;
+            (*mi)->param1 = 0;
             Add_mission_item(mi);
         }
     }
     if (!camera_series_by_time_active_in_wp) {
         if (camera_series_by_time_active) {
             camera_series_by_time_active = false;
-
-            Camera_series_by_time_action::Ptr a =
-                action->Get_action<Action::Type::CAMERA_SERIES_BY_TIME>();
-            mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+            auto mi = Create_mission_item();
             (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
             (*mi)->param1 = ardu_vehicle.camera_servo_idx;
+            (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
+            (*mi)->param3 = 1;
+            (*mi)->param4 = 0;
             Add_mission_item(mi);
         }
     }
     camera_series_by_dist_active_in_wp = false;
     camera_series_by_time_active_in_wp = false;
+}
 
-    if (last_move_action) {
-        auto from = last_move_action->Get_action<Action::Type::MOVE>();
-        auto to = action->Get_action<Action::Type::MOVE>();
-        float calculated_heading = from->position.Bearing(to->position);
+void
+Ardupilot_vehicle::Task_upload::Prepare_move(const Property_list& params)
+{
+    Stop_camera_series();
+
+    auto mi = Build_wp_mission_item(params);
+    if (last_move_params) {
+        auto last_pos = Create_mission_item_with_coords(*last_move_params);
+        auto from = Wgs84_position(Geodetic_tuple((*last_pos)->x, (*last_pos)->y, (*last_pos)->z));
+        auto to = Wgs84_position(Geodetic_tuple((*mi)->x, (*mi)->y, (*mi)->z));
+        float calculated_heading = from.Bearing(to);
         // Handle several waypoints at the same coords.
         if (!std::isnan(calculated_heading)) {
             calculated_heading = Normalize_angle_0_2pi(calculated_heading);
@@ -2518,25 +2921,29 @@ Ardupilot_vehicle::Task_upload::Prepare_move(Action::Ptr& action)
             Add_mission_item(Build_roi_mission_item(*current_mission_poi));
         }
     } else {
+        float new_heading = current_heading;
         if (current_mission_heading) {
             // Set current heading as yaw angle.
-            current_heading = *current_mission_heading;
+            new_heading = *current_mission_heading;
         } else {
             if (ardu_vehicle.autoheading) {
                 // Set heading to next waypoint as yaw angle.
-                current_heading = heading_to_this_wp;
+                new_heading = heading_to_this_wp;
             }
         }
-        if (last_move_action && ardu_vehicle.Get_type() == Type::COPTER
-            && (current_mission_heading || ardu_vehicle.autoheading)) {
-            // Autoheading is copter specific.
-            LOG("Set Autoheading to %f", current_heading);
-            Add_mission_item(Build_heading_mission_item(current_heading));
+        // Do not autoadd set_heading if it changes less than given treshold.
+        if (fabs(new_heading - current_heading) > CHANGE_HEADING_TRESHOLD) {
+            current_heading = new_heading;
+            if (last_move_params && ardu_vehicle.Is_copter()) {
+                // Autoheading is copter specific.
+                VEHICLE_LOG_INF(vehicle, "Set Autoheading to %f", current_heading);
+                Add_mission_item(Build_heading_mission_item(current_heading));
+            }
         }
     }
 
-    Add_mission_item(Build_wp_mission_item(action));
-    last_move_action = action;
+    Add_mission_item(mi);
+    last_move_params = params;
 
     restart_mission_poi = false;
     first_mission_poi_set = false;
@@ -2544,29 +2951,32 @@ Ardupilot_vehicle::Task_upload::Prepare_move(Action::Ptr& action)
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_wait(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_wait(const Property_list& params)
 {
     /* Create additional waypoint on the current position to wait. */
-    if (last_move_action) {
+    if (last_move_params) {
         first_mission_poi_set = false;
         restart_mission_poi = true;
-        Wait_action::Ptr wa = action->Get_action<Action::Type::WAIT>();
-        auto wp = Build_wp_mission_item(last_move_action);
-        (*wp)->param1 = wa->wait_time;
-        switch (ardu_vehicle.Get_type()) {
-        case Type::COPTER:
+        float wait_time;
+        params.Get_value("time", wait_time);
+        auto wp = Build_wp_mission_item(*last_move_params);
+        (*wp)->param1 = wait_time;
+        switch (ardu_vehicle.Get_vehicle_type()) {
+        case proto::VEHICLE_TYPE_MULTICOPTER:
+        case proto::VEHICLE_TYPE_HELICOPTER:
             if (!current_mission_poi && ardu_vehicle.autoheading) {
                 Add_mission_item(Build_heading_mission_item(
-                        Normalize_angle_0_2pi(current_heading)));
+                    Normalize_angle_0_2pi(current_heading)));
             }
-            if (wa->wait_time < 0) {
+            if (wait_time < 0) {
                 (*wp)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LOITER_UNLIM;
             } else {
                 (*wp)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LOITER_TIME;
             }
             break;
-        case Type::PLANE:
-            if (wa->wait_time < 0) {
+        case proto::VEHICLE_TYPE_FIXED_WING:
+        case proto::VEHICLE_TYPE_VTOL:
+            if (wait_time < 0) {
                 (*wp)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LOITER_UNLIM;
             } else {
                 (*wp)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LOITER_TIME;
@@ -2583,123 +2993,129 @@ Ardupilot_vehicle::Task_upload::Prepare_wait(Action::Ptr& action)
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_payload_steering(Action::Ptr&)
+Ardupilot_vehicle::Task_upload::Prepare_takeoff_mission(const Property_list& params)
 {
-    ASSERT(false); /* Not implemented yet */
-}
-
-void
-Ardupilot_vehicle::Task_upload::Prepare_takeoff(Action::Ptr& action)
-{
-    /* Ardupilot does not fly to the takeoff position after takeoff
-     * is done. Add explicit waypoint after the takeoff command with
-     * target coordinates.
-     */
-    auto takeoff = action->Get_action<Action::Type::TAKEOFF>();
-    auto explicit_wp = Move_action::Create(
-            takeoff->position,
-            0,
-            takeoff->acceptance_radius,
-            0,
-            takeoff->heading,
-            takeoff->elevation);
-
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    if (ardu_vehicle.vtol_plane) {
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_VTOL_TAKEOFF;
+    auto mi = Create_mission_item_with_coords(params);
+    if (vehicle.Is_vehicle_type(proto::VEHICLE_TYPE_VTOL)) {
+        (*mi)->command = mavlink::MAV_CMD_NAV_VTOL_TAKEOFF;
     } else {
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_TAKEOFF;
+        (*mi)->command = mavlink::MAV_CMD_NAV_TAKEOFF;
     }
     (*mi)->param1 = 0; /* No data for pitch. */
-    Fill_mavlink_mission_item_coords(*mi, takeoff->position.Get_geodetic(), takeoff->heading);
     Add_mission_item(mi);
-    Prepare_action(explicit_wp);
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_landing(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_landing(const Property_list& params)
 {
     /* Ardupilot does not take the altitude of the landing, so
      * add explicit waypoint guiding vehicle to the landing start
      * position.
      */
-    auto land = action->Get_action<Action::Type::LANDING>();
-    auto explicit_wp = Move_action::Create(
-            land->position,
-            0,
-            land->acceptance_radius,
-            0,
-            land->heading,
-            land->elevation);
-    Prepare_action(explicit_wp);
+    Prepare_move(params);
 
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    if (ardu_vehicle.vtol_plane) {
+    auto mi = Create_mission_item_with_coords(params);
+    if (vehicle.Is_vehicle_type(proto::VEHICLE_TYPE_VTOL)) {
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_VTOL_LAND;
     } else {
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LAND;
     }
-    Fill_mavlink_mission_item_coords(*mi, land->position.Get_geodetic(), land->heading);
     Add_mission_item(mi);
 
     /* Don't duplicate waypoint if last action is land. */
-    last_move_action = nullptr;
+    last_move_params.Disengage();
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_set_servo(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_set_servo(const Property_list& params)
 {
-    Set_servo_action::Ptr ssa = action->Get_action<Action::Type::SET_SERVO>();
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    int tmp;
+    auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
-    (*mi)->param1 = ssa->servo_id;
-    (*mi)->param2 = ssa->pwm;
+    params.Get_value("servo_id", tmp);
+    (*mi)->param1 = tmp;
+    params.Get_value("pwm", tmp);
+    (*mi)->param2 = tmp;
     Add_mission_item(mi);
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_repeat_servo(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_repeat_servo(const Property_list& params)
 {
-    Repeat_servo_action::Ptr ssa = action->Get_action<Action::Type::REPEAT_SERVO>();
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    int tmp;
+    float tmpf;
+    auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-    (*mi)->param1 = ssa->servo_id;
-    (*mi)->param2 = ssa->pwm;
-    (*mi)->param3 = ssa->count;
-    if (ssa->period < 0.2) {
+    params.Get_value("servo_id", tmp);
+    (*mi)->param1 = tmp;
+    params.Get_value("pwm", tmp);
+    (*mi)->param2 = tmp;
+    params.Get_value("count", tmp);
+    (*mi)->param3 = tmp;
+    params.Get_value("delay", tmpf);
+    if (tmpf < 0.2) {
         (*mi)->param4 = 0;
     } else {
         // Pixhawk does this slower than expected. Add coefficient.
-        (*mi)->param4 = ssa->period * 2 - 0.4;
+        (*mi)->param4 = tmpf * 2 - 0.4;
     }
     Add_mission_item(mi);
 }
 
 void
-
-Ardupilot_vehicle::Task_upload::Prepare_change_speed(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_payload_control(const Property_list& params)
 {
-    Change_speed_action::Ptr la = action->Get_action<Action::Type::CHANGE_SPEED>();
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    float tmp;
+    auto mi = Create_mission_item();
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_MOUNT_CONTROL;
+    params.Get_value("tilt", tmp);
+    (*mi)->param1 = tmp * 180.0 / M_PI;
+    params.Get_value("roll", tmp);
+    (*mi)->param2 = tmp * 180.0 / M_PI;
+    params.Get_value("yaw", tmp);
+    (*mi)->param3 = tmp * 180.0 / M_PI;
+    (*mi)->z = mavlink::MAV_MOUNT_MODE::MAV_MOUNT_MODE_MAVLINK_TARGETING;
+    Add_mission_item(mi);
+}
+
+void
+Ardupilot_vehicle::Task_upload::Prepare_change_speed(const Property_list& params)
+{
+    if (ardu_vehicle.ignore_speed_in_route) {
+        return;
+    }
+
+    auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_CHANGE_SPEED;
-    auto speed = hypot(la->speed, la->vertical_speed);
-    switch (ardu_vehicle.Get_type()) {
-    case Type::COPTER:
+
+    float xspeed, zspeed;
+    params.Get_value("ground_speed", xspeed);
+    params.Get_value("vertical_speed", zspeed);
+    auto speed = hypot(xspeed, zspeed);
+
+    if (fabs(current_speed - speed) < CHANGE_SPEED_TRESHOLD) {
+        // Do not generate change_speed if the change is too small.
+        return;
+    }
+    current_speed = speed;
+
+    switch (ardu_vehicle.Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_HELICOPTER:
         /* ArduCopter version up to 3.2 use p1 for speed and ignores p2.
          * ArduCopter version up to 3.2+ use p2 for speed and ignores p1.
          * So, we set both, here.
          * Later, if MAV_CMD_DO_CHANGE_SPEED handling changes
          * in ArduPilot we will need to implement FW version checking.
          */
-        (*mi)->param1 = speed;
-        (*mi)->param2 = speed;
+        (*mi)->param1 = current_speed;
+        (*mi)->param2 = current_speed;
         break;
-    case Type::ROVER:
     default:
         /* Ground rover takes only airspeed into account, others seems to
          * take both, but we have only airspeed from UCS, so use only air. */
         (*mi)->param1 = 0; /* Airspeed. */
-        (*mi)->param2 = speed;
+        (*mi)->param2 = current_speed;
         break;
     }
 
@@ -2708,113 +3124,141 @@ Ardupilot_vehicle::Task_upload::Prepare_change_speed(Action::Ptr& action)
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_set_home(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_set_home(const Property_list& params)
 {
-    Set_home_action::Ptr sa = action->Get_action<Action::Type::SET_HOME>();
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    auto mi = Create_mission_item_with_coords(params);
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_HOME;
-    (*mi)->param1 = sa->use_current_position ? 1 : 0;
-    Fill_mavlink_mission_item_coords(*mi, sa->home_position.Get_geodetic(), 0);
+    (*mi)->param1 = 0;
+    (*mi)->z = (*mi)->z.Get() + altitude_origin;
+    (*mi)->frame = mavlink::MAV_FRAME_GLOBAL;
     Add_mission_item(mi);
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_POI(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_poi(const Property_list& params)
 {
-    Poi_action::Ptr pa = action->Get_action<Action::Type::POI>();
-    if (pa->active) {
-        // Set up POI for succeeding waypoints.
-        current_mission_poi = pa->position.Get_geodetic();
-        Add_mission_item(Build_roi_mission_item(*current_mission_poi));
-        first_mission_poi_set = true;
+    if (vehicle.Is_copter()) {
+        bool active;
+        params.Get_value("active", active);
+        if (active) {
+            // Set up POI for succeeding waypoints.
+            current_mission_poi = Create_geodetic_tuple(params);
+            Add_mission_item(Build_roi_mission_item(*current_mission_poi));
+            first_mission_poi_set = true;
+        } else {
+            // Reset POI.
+            if (ardu_vehicle.autoheading) {
+                // Set to something out of normal range to make sure heading action is added
+                // to terminate POI.
+                current_heading = 1000;
+            } else {
+                Add_mission_item(Build_roi_mission_item(Geodetic_tuple(0, 0, 0)));
+            }
+            current_mission_poi.Disengage();
+        }
     } else {
-        // Reset POI. Generate next WPs as heading from now on.
-        current_mission_poi.Disengage();
+        VEHICLE_LOG_ERR(vehicle, "set_poi ignored");
     }
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_heading(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_heading(const Property_list& params)
 {
-    Heading_action::Ptr ha = action->Get_action<Action::Type::HEADING>();
-    Add_mission_item(Build_heading_mission_item(ha->heading));
-    current_heading = ha->heading;
-    current_mission_heading = ha->heading;
-    // Heading action terminates current POI.
-    restart_mission_poi = true;
+    if (vehicle.Is_copter()) {
+        float heading;
+        params.Get_value("heading", heading);
+        Add_mission_item(Build_heading_mission_item(heading));
+        current_heading = heading;
+        current_mission_heading = heading;
+        // Heading action terminates current POI.
+        restart_mission_poi = true;
+    } else {
+        VEHICLE_LOG_ERR(vehicle, "set_heading ignored");
+    }
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_camera_series_by_distance(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_camera_series_by_distance(const Property_list& params)
 {
-    Camera_series_by_distance_action::Ptr a =
-        action->Get_action<Action::Type::CAMERA_SERIES_BY_DISTANCE>();
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    if (ardu_vehicle.camera_servo_idx != -1) {
+        VEHICLE_LOG_WRN(vehicle, "trigger_by_distance ignored.");
+        return;
+    }
+    float tmp;
+    auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_CAM_TRIGG_DIST;
-    (*mi)->param1 = a->interval;
+    params.Get_value("distance", tmp);
+    (*mi)->param1 = tmp;
     Add_mission_item(mi);
     camera_series_by_dist_active = true;
     camera_series_by_dist_active_in_wp = true;
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_camera_series_by_time(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_camera_series_by_time(const Property_list& params)
 {
-    Camera_series_by_time_action::Ptr a =
-        action->Get_action<Action::Type::CAMERA_SERIES_BY_TIME>();
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-    (*mi)->param1 = ardu_vehicle.camera_servo_idx;
-    (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
-    (*mi)->param3 = a->count ? *a->count : 0xffff;
-    (*mi)->param4 = static_cast<float>(a->interval.count()) / 1000.0;
-    Add_mission_item(mi);
-    camera_series_by_time_active = true;
-    camera_series_by_time_active_in_wp = true;
-}
-
-void
-Ardupilot_vehicle::Task_upload::Prepare_camera_trigger(Action::Ptr& action)
-{
-    Camera_trigger_action::Ptr a =
-        action->Get_action<Action::Type::CAMERA_TRIGGER>();
-    if (a->state != Camera_trigger_action::State::SINGLE_PHOTO &&
-        a->state != Camera_trigger_action::State::SERIAL_PHOTO) {
-        VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", a->state);
+    if (ardu_vehicle.camera_servo_idx == -1) {
+        VEHICLE_LOG_WRN(vehicle, "trigger_by_time ignored.");
         return;
     }
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    int tmp;
+    float tmpf;
+    auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
     (*mi)->param1 = ardu_vehicle.camera_servo_idx;
     (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
-    if (a->state == Camera_trigger_action::State::SINGLE_PHOTO) {
-        (*mi)->param3 = 1;
-        (*mi)->param4 = ardu_vehicle.camera_servo_time;
+    if (params.Get_value("count", tmp) && tmp > 0) {
+        (*mi)->param3 = tmp;
     } else {
-        (*mi)->param3 = 0xffff;
-        (*mi)->param4 = static_cast<float>(a->interval.count()) / 1000.0;
-        camera_series_by_time_active = true;
-        camera_series_by_time_active_in_wp = true;
+        (*mi)->param3 = 32767;    // infinity packed in signed short because Ardupilot uses short internally.
     }
+    params.Get_value("period", tmpf);
+    (*mi)->param4 = tmpf;
     Add_mission_item(mi);
     camera_series_by_time_active = true;
     camera_series_by_time_active_in_wp = true;
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_vtol_transition(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_camera_trigger(const Property_list& params)
 {
-    if (ardu_vehicle.vtol_plane) {
-        auto a = action->Get_action<Action::Type::VTOL_TRANSITION>();
-        mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    int state;
+    params.Get_value("state", state);
+
+    if (state != proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO &&
+        state != proto::CAMERA_MISSION_TRIGGER_STATE_SERIAL_PHOTO) {
+        VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
+        return;
+    }
+    if (state == proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO) {
+        Add_camera_trigger_item();
+    } else {
+        if (ardu_vehicle.camera_servo_idx == -1) {
+            VEHICLE_LOG_WRN(vehicle, "Command repeat_trigger ignored.");
+            return;
+        }
+        auto mi = Create_mission_item();
+        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
+        (*mi)->param1 = ardu_vehicle.camera_servo_idx;
+        (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
+        (*mi)->param3 = 32767;    // infinity packed in signed short.
+        (*mi)->param4 = ardu_vehicle.camera_servo_time;
+        camera_series_by_time_active = true;
+        camera_series_by_time_active_in_wp = true;
+        Add_mission_item(mi);
+    }
+}
+
+void
+Ardupilot_vehicle::Task_upload::Prepare_vtol_transition(bool vtol)
+{
+    if (vehicle.Get_vehicle_type() == proto::VEHICLE_TYPE_VTOL) {
+        auto mi = Create_mission_item();
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_VTOL_TRANSITION;
-        switch (a->mode) {
-        case Vtol_transition_action::FIXED:
-            (*mi)->param1 = mavlink::MAV_VTOL_STATE_FW;
-            break;
-        case Vtol_transition_action::VTOL:
+        if (vtol) {
             (*mi)->param1 = mavlink::MAV_VTOL_STATE_MC;
-            break;
+        } else {
+            (*mi)->param1 = mavlink::MAV_VTOL_STATE_FW;
         }
         Add_mission_item(mi);
     } else {
@@ -2823,45 +3267,79 @@ Ardupilot_vehicle::Task_upload::Prepare_vtol_transition(Action::Ptr& action)
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_panorama(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Prepare_wait_until(const Property_list& params)
 {
-    Panorama_action::Ptr panorama = action->Get_action<Action::Type::PANORAMA>();
+    auto mi = Create_mission_item();
+    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_DELAY;
+    int64_t t;
+    if (params.Get_value("time", t)) {
+        std::time_t tt = t / 1000;  // remove the millisecond part.
+        tm local_tm = *localtime(&tt);
+        tm utc_tm = *gmtime(&tt);
+        VEHICLE_LOG_INF(vehicle, "Will wait until %04d-%02d-%02d %02d:%02d:%02d UTC (%02d:%02d:%02d local)",
+            utc_tm.tm_year + 1900,
+            utc_tm.tm_mon + 1,
+            utc_tm.tm_mday,
+            utc_tm.tm_hour,
+            utc_tm.tm_min,
+            utc_tm.tm_sec,
+            local_tm.tm_hour,
+            local_tm.tm_min,
+            local_tm.tm_sec);
+        (*mi)->param1 = -1;
+        (*mi)->param2 = utc_tm.tm_hour;
+        (*mi)->param3 = utc_tm.tm_min;
+        (*mi)->param4 = utc_tm.tm_sec;
+    } else {
+        (*mi)->param1 = 409968000;   // let infinity be 13 years.
+    }
+    Add_mission_item(mi);
+}
 
-    if (!last_move_action) {
+void
+Ardupilot_vehicle::Task_upload::Prepare_panorama(const Property_list& params)
+{
+    if (!vehicle.Is_copter()) {
+        VEHICLE_LOG_ERR(vehicle, "Only copters support panorama");
+    }
+    float angle, speed, panorama_step, panorama_delay;
+    int mode;
+
+    params.Get_value("mode", mode);
+    params.Get_value("angle", angle);
+    params.Get_value("speed", speed);
+    params.Get_value("step", panorama_step);
+    params.Get_value("delay", panorama_delay);
+
+    if (!last_move_params) {
         VEHICLE_LOG_WRN(vehicle, "No previous move action found to generate panorama action, ignored.");
         return;
     }
-//    LOG("Panorama angle=%f, speed=%f, step=%f, delay=%lu",
-//            panorama->angle,
-//            panorama->speed,
-//            panorama->step,
-//            panorama->delay.count()
-//            );
 
     /* Panorama is always done in steps less then 180 degree to make sure that
      * turns over 180 degrees are supported.
      */
     double MAX_STEP = 3;
-    double speed = std::abs(panorama->speed);
+    speed = std::abs(speed);
     if (speed == 0 || speed > 1) {
         speed = 1; /* 1 rad/second assumed max speed. */
     }
 
     float cur_angle = 0;
-    float target_angle = std::abs(panorama->angle);
+    float target_angle = std::abs(angle);
     float step = MAX_STEP;
     int delay = 0;
     // Set delay to slightly more than the calculated time.
-    double panorama_duration = std::abs(panorama->angle) / speed + 3;
+    double panorama_duration = std::abs(angle) / speed + 3;
 
-    switch (panorama->trigger_state) {
-    case Panorama_action::Trigger_state::ON:
+    switch (mode) {
+    case proto::PANORAMA_MODE_VIDEO:
         break;
-    case Panorama_action::Trigger_state::SERIAL:
+    case proto::PANORAMA_MODE_PHOTO:
         /* Per-sector delay. */
-        delay = std::chrono::duration_cast<std::chrono::seconds>(panorama->delay).count();
+        delay = panorama_delay;
         // non zero delay. Use step from action.
-        step = std::abs(panorama->step);
+        step = std::abs(panorama_step);
         // Add some time the delay to make the turn.
         delay += step / speed + 2;
         // do not add the long pause waypoint at the end.
@@ -2877,7 +3355,7 @@ Ardupilot_vehicle::Task_upload::Prepare_panorama(Action::Ptr& action)
     Add_mission_item(Build_heading_mission_item(current_heading));
     /* Create additional waypoint at the current position with wait to
      * stabilize before doing panorama. */
-    auto waiter = Build_wp_mission_item(last_move_action);
+    auto waiter = Build_wp_mission_item(*last_move_params);
     (*waiter)->param1 = 2; /* seconds. */
     Add_mission_item(waiter);
 
@@ -2900,7 +3378,7 @@ Ardupilot_vehicle::Task_upload::Prepare_panorama(Action::Ptr& action)
                 cur_step_angle = step;
             }
             float temp_heading = cur_angle + cur_step_angle;
-            if (panorama->angle < 0) {
+            if (angle < 0) {
                 temp_heading = -temp_heading;
             }
             Add_mission_item(Build_heading_mission_item(
@@ -2908,7 +3386,7 @@ Ardupilot_vehicle::Task_upload::Prepare_panorama(Action::Ptr& action)
                     speed));
         }
         if (delay) {
-            waiter = Build_wp_mission_item(last_move_action);
+            waiter = Build_wp_mission_item(*last_move_params);
             (*waiter)->param1 = delay;
             Add_mission_item(waiter);
 
@@ -2917,7 +3395,7 @@ Ardupilot_vehicle::Task_upload::Prepare_panorama(Action::Ptr& action)
         }
         cur_angle += cur_step_angle;
     }
-    if (panorama->angle > 0) {
+    if (angle > 0) {
         current_heading = Normalize_angle_0_2pi(current_heading + target_angle);
     } else {
         current_heading = Normalize_angle_0_2pi(current_heading - target_angle);
@@ -2929,7 +3407,7 @@ Ardupilot_vehicle::Task_upload::Prepare_panorama(Action::Ptr& action)
      */
     if (panorama_duration) {
         VEHICLE_LOG_WRN(vehicle, "Estimated panorama duration is %f seconds.", panorama_duration);
-        auto long_wait = Build_wp_mission_item(last_move_action);
+        auto long_wait = Build_wp_mission_item(*last_move_params);
         if (panorama_duration > 255) {
             VEHICLE_LOG_WRN(vehicle, "Estimated panorama duration is truncated to 255 seconds.");
             (*long_wait)->param1 = 255; /* Max possible wait for Ardupilot. */
@@ -2943,18 +3421,6 @@ Ardupilot_vehicle::Task_upload::Prepare_panorama(Action::Ptr& action)
     restart_mission_poi = true;
 }
 
-void
-Ardupilot_vehicle::Task_upload::Prepare_camera_control(Action::Ptr& action)
-{
-    Camera_control_action::Ptr cam_control =
-            action->Get_action<Action::Type::CAMERA_CONTROL>();
-
-    /* TODO wait until supported by Ardupilot. */
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_MOUNT_CONTROL;
-    Add_mission_item(mi);
-}
-
 mavlink::Pld_mission_item::Ptr
 Ardupilot_vehicle::Task_upload::Build_heading_mission_item(
         float heading,
@@ -2963,7 +3429,7 @@ Ardupilot_vehicle::Task_upload::Build_heading_mission_item(
         bool clockwise
         )
 {
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_CONDITION_YAW;
     (*mi)->param1 = (Normalize_angle_0_2pi(heading) * 180.0) / M_PI;
     (*mi)->param2 = (speed * 180) / M_PI;
@@ -2975,19 +3441,24 @@ Ardupilot_vehicle::Task_upload::Build_heading_mission_item(
 void
 Ardupilot_vehicle::Task_upload::Add_camera_trigger_item()
 {
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
-    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-    (*mi)->param1 = ardu_vehicle.camera_servo_idx;
-    (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
-    (*mi)->param3 = 1;
-    (*mi)->param4 = ardu_vehicle.camera_servo_time;
+    auto mi = Create_mission_item();
+    if (ardu_vehicle.camera_servo_idx == -1) {
+        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_DIGICAM_CONTROL;
+        (*mi)->x = 1;
+    } else {
+        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
+        (*mi)->param1 = ardu_vehicle.camera_servo_idx;
+        (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
+        (*mi)->param3 = 1;  // do it once
+        (*mi)->param4 = ardu_vehicle.camera_servo_time;
+    }
     Add_mission_item(mi);
 }
 
 mavlink::Pld_mission_item::Ptr
 Ardupilot_vehicle::Task_upload::Build_roi_mission_item(const Geodetic_tuple& coords)
 {
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_ROI;
     if (coords.latitude == 0 && coords.longitude == 0 && coords.altitude == 0)
     {
@@ -3000,81 +3471,106 @@ Ardupilot_vehicle::Task_upload::Build_roi_mission_item(const Geodetic_tuple& coo
 }
 
 mavlink::Pld_mission_item::Ptr
-Ardupilot_vehicle::Task_upload::Build_wp_mission_item(Action::Ptr& action)
+Ardupilot_vehicle::Task_upload::Build_wp_mission_item(const Property_list& params)
 {
-    Move_action::Ptr ma = action->Get_action<Action::Type::MOVE>();
-    mavlink::Pld_mission_item::Ptr mi = mavlink::Pld_mission_item::Create();
+    auto mi = Create_mission_item_with_coords(params);
 
-    if (ardu_vehicle.Get_type() == Type::COPTER) {
-        switch (ma->turn_type) {
-        case Move_action::TURN_TYPE_SPLINE:
+    int tt;
+    if (ardu_vehicle.Is_copter() && params.Get_value("turn_type", tt) && last_move_params) {
+        // Check turn_type only for copter and non-first waypoints.
+        // (If first WP is spline, autopilot effectively ignores it)
+        switch (tt) {
+        case proto::TURN_TYPE_SPLINE:
             (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_SPLINE_WAYPOINT;
             break;
         default:
-            VEHICLE_LOG_WRN(vehicle, "Invalid turn type: %d, defaulting to 'straight'.", ma->turn_type);
-        case Move_action::TURN_TYPE_STRAIGHT:
+            VEHICLE_LOG_WRN(vehicle, "Invalid turn type: %d, defaulting to 'straight'.", tt);
+            /* no break */
+        case proto::TURN_TYPE_STRAIGHT:
             (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
             break;
         }
     } else {
+        // plane, rover, turn_type not specified or this is the first waypoint
         (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
     }
-    (*mi)->param1 = ma->wait_time;
-    /* Set acceptance radius to something reasonable. */
-    if (ma->acceptance_radius < ACCEPTANCE_RADIUS_MIN) {
-        (*mi)->param2 = ACCEPTANCE_RADIUS_MIN;
-        VEHICLE_LOG_INF(vehicle, "Acceptance radius normalized from %f to %f",
-                ma->acceptance_radius, (*mi)->param2.Get());
-    } else {
-        (*mi)->param2 = ma->acceptance_radius;
+    float tmp;
+    if (params.Get_value("wait_time", tmp)) {
+        (*mi)->param1 = tmp;
     }
-    (*mi)->param3 = ma->loiter_orbit;
-    Fill_mavlink_mission_item_coords(*mi, ma->position.Get_geodetic(), ma->heading);
+    if (params.Get_value("acceptance_radius", tmp)) {
+        /* Set acceptance radius to something reasonable. */
+        if (tmp < ACCEPTANCE_RADIUS_MIN) {
+            (*mi)->param2 = ACCEPTANCE_RADIUS_MIN;
+            VEHICLE_LOG_INF(vehicle, "Acceptance radius normalized from %f to %f",
+                tmp, (*mi)->param2.Get());
+        } else {
+            (*mi)->param2 = tmp;
+        }
+    }
+    if (params.Get_value("loiter_orbit", tmp)) {
+        (*mi)->param3 = tmp;
+    }
     return mi;
 }
 
 void
 Ardupilot_vehicle::Process_heartbeat(
-            ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::HEARTBEAT>::Ptr message)
+            mavlink::Message<mavlink::MESSAGE_ID::HEARTBEAT>::Ptr message)
 {
+    // Process heartbeats only from vehicle
+    if (!Is_vehicle_heartbeat_valid(message)) {
+        return;
+    }
+
     auto new_mode = message->payload->custom_mode.Get();
-    Sys_status::Control_mode control_mode = Map_control_mode(new_mode);
+
+    Update_control_mode(new_mode);
     Update_flight_mode(new_mode);
 
     if (current_native_flight_mode != static_cast<int>(new_mode)) {
         const char* name = Get_native_flight_mode_name(new_mode);
+        const char* prev_name = Get_native_flight_mode_name(current_native_flight_mode);
         VEHICLE_LOG_INF((*this),
-            "Flight mode changed from %d to %s (%d)",
+            "Flight mode changed from %s (%d) to %s (%d)",
+            prev_name,
             static_cast<int>(current_native_flight_mode),
             name,
             static_cast<int>(new_mode));
         current_native_flight_mode = new_mode;
-        t_native_flight_mode->Set_value(name);
-
-        Add_status_message("Flight mode changed to " + std::string(name));
+        std::string s;
+        if (name == nullptr) {
+            s = std::to_string(new_mode);
+        } else {
+            s = std::string(name);
+        }
+        t_native_flight_mode->Set_value(s);
+        Add_status_message("Flight mode changed to " + s);
     }
 
-    Sys_status::State state = Sys_status::State::DISARMED;
-    if (message->payload->base_mode.Get() & mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_SAFETY_ARMED) {
-        state = Sys_status::State::ARMED;
-    }
+    bool armed_new = message->payload->base_mode.Get() & mavlink::MAV_MODE_FLAG::MAV_MODE_FLAG_SAFETY_ARMED;
+    bool armed_old = false;
+    t_is_armed->Get_value(armed_old);
+    t_is_armed->Set_value(armed_new);
 
-    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - recent_connect);
+    if (armed_new && !armed_old && !set_heading_needs_wp) {
+        // Reset "WP required before set_heading" on arm.
+        set_heading_needs_wp = true;
+    }
 
     is_airborne = message->payload->system_status.Get() == mavlink::MAV_STATE_ACTIVE;
 
     Update_capabilities();
     Update_capability_states();
-    Set_system_status(Sys_status(true, true, control_mode, state, uptime));
 }
 
 /** Map custom flight mode from the heartbeat to our flight mode. */
 void
 Ardupilot_vehicle::Update_flight_mode(int mode)
 {
-    switch (Get_type()) {
-    case Type::COPTER:
+    switch (Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_HELICOPTER:
         switch (static_cast<Copter_flight_mode>(mode)) {
         case Copter_flight_mode::AUTO:
             if (Is_current_command(mavlink::MAV_CMD_NAV_LOITER_UNLIM)) {
@@ -3084,6 +3580,7 @@ Ardupilot_vehicle::Update_flight_mode(int mode)
             }
             break;
         case Copter_flight_mode::RTL:
+        case Copter_flight_mode::SMART_RTL:
             current_flight_mode = proto::FLIGHT_MODE_RTH;
             break;
         case Copter_flight_mode::LAND:
@@ -3093,19 +3590,8 @@ Ardupilot_vehicle::Update_flight_mode(int mode)
             current_flight_mode.Disengage();
         }
         break;
-    case Type::ROVER:
-        switch (static_cast<Rover_flight_mode>(mode)) {
-        case Rover_flight_mode::AUTO:
-            current_flight_mode = proto::FLIGHT_MODE_WAYPOINTS;
-            break;
-        case Rover_flight_mode::RTL:
-            current_flight_mode = proto::FLIGHT_MODE_RTH;
-            break;
-        default:
-            current_flight_mode.Disengage();
-        }
-        break;
-    case Type::PLANE:
+    case proto::VEHICLE_TYPE_FIXED_WING:
+    case proto::VEHICLE_TYPE_VTOL:
         switch (static_cast<Plane_flight_mode>(mode)) {
         case Plane_flight_mode::AUTO:
             current_flight_mode = proto::FLIGHT_MODE_WAYPOINTS;
@@ -3117,10 +3603,23 @@ Ardupilot_vehicle::Update_flight_mode(int mode)
             current_flight_mode.Disengage();
         }
         break;
+    case proto::VEHICLE_TYPE_GROUND:
+        switch (static_cast<Rover_flight_mode>(mode)) {
+        case Rover_flight_mode::AUTO:
+            current_flight_mode = proto::FLIGHT_MODE_WAYPOINTS;
+            break;
+        case Rover_flight_mode::RTL:
+            current_flight_mode = proto::FLIGHT_MODE_RTH;
+            break;
+        default:
+            current_flight_mode.Disengage();
+        }
+        break;
     default:
         current_flight_mode.Disengage();
         break;
     }
+
     if (current_flight_mode) {
         t_flight_mode->Set_value(*current_flight_mode);
     } else {
@@ -3145,7 +3644,7 @@ Ardupilot_vehicle::Get_home_location()
 void
 Ardupilot_vehicle::Download_mission()
 {
-    if (!read_waypoints.In_progress()) {
+    if (!read_waypoints.In_progress() && !disable_mission_download) {
         t_current_mission_id->Set_value_na();
         current_command_map.Reset();
         current_route.Reset();
@@ -3156,8 +3655,9 @@ Ardupilot_vehicle::Download_mission()
 void
 Ardupilot_vehicle::Update_capabilities()
 {
-    switch (Get_type()) {
-    case Type::COPTER:
+    switch (Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_HELICOPTER:
         c_arm->Set_available(true);
         c_disarm->Set_available(true);
         c_waypoint->Set_available(true);
@@ -3169,13 +3669,14 @@ Ardupilot_vehicle::Update_capabilities()
         c_rth->Set_available(true);
         c_set_servo->Set_available(true);
         c_repeat_servo->Set_available(true);
+        c_camera_trigger_command->Set_available(true);
         // Copter has LAND and sometimes -- joystick.
         c_land_command->Set_available(true);
         c_joystick->Set_available(true);
         c_direct_vehicle_control->Set_available(Is_control_mode(proto::CONTROL_MODE_JOYSTICK));
         break;
-
-    case Type::PLANE:
+    case proto::VEHICLE_TYPE_FIXED_WING:
+    case proto::VEHICLE_TYPE_VTOL:
         c_arm->Set_available(true);
         c_disarm->Set_available(true);
         c_waypoint->Set_available(true);
@@ -3187,6 +3688,7 @@ Ardupilot_vehicle::Update_capabilities()
         c_rth->Set_available(true);
         c_set_servo->Set_available(true);
         c_repeat_servo->Set_available(true);
+        c_camera_trigger_command->Set_available(true);
         if (enable_joystick_control_for_fixed_wing) {
             c_joystick->Set_available(true);
             c_direct_vehicle_control->Set_available(Is_control_mode(proto::CONTROL_MODE_JOYSTICK));
@@ -3195,14 +3697,10 @@ Ardupilot_vehicle::Update_capabilities()
             c_direct_vehicle_control->Set_available(false);
         }
         break;
-
-    case Type::ROVER:
+    case proto::VEHICLE_TYPE_GROUND:
         c_auto->Set_available(true);
         c_manual->Set_available(true);
         c_rth->Set_available(true);
-        break;
-
-    case Type::OTHER:
         break;
     }
 }
@@ -3210,10 +3708,20 @@ Ardupilot_vehicle::Update_capabilities()
 void
 Ardupilot_vehicle::Configure()
 {
-    auto props = ugcs::vsm::Properties::Get_instance().get();
-    camera_servo_idx = props->Get_int("vehicle.ardupilot.camera_servo_idx");
-    camera_servo_pwm = props->Get_int("vehicle.ardupilot.camera_servo_pwm");
-    camera_servo_time = props->Get_float("vehicle.ardupilot.camera_servo_time");
+    auto props = Properties::Get_instance().get();
+    if (props->Exists("vehicle.ardupilot.camera_servo_idx")) {
+        camera_servo_idx = props->Get_int("vehicle.ardupilot.camera_servo_idx");
+        if (props->Exists("vehicle.ardupilot.camera_servo_pwm")) {
+            camera_servo_pwm = props->Get_int("vehicle.ardupilot.camera_servo_pwm");
+        }
+        if (props->Exists("vehicle.ardupilot.camera_servo_time")) {
+            camera_servo_time = props->Get_float("vehicle.ardupilot.camera_servo_time");
+        }
+        LOG_WARN("camera_servo_idx=%d. Camera trigger by distance in mission is disabled.", camera_servo_idx);
+    } else {
+        LOG_WARN("No camera_servo_idx specified. Camera trigger by time in mission is disabled.");
+    }
+
     if (props->Exists("vehicle.ardupilot.enable_joystick_control_for_fixed_wing")) {
         auto yes = props->Get("vehicle.ardupilot.enable_joystick_control_for_fixed_wing");
         if (yes == "yes") {
@@ -3258,6 +3766,7 @@ Ardupilot_vehicle::Configure()
         VEHICLE_LOG_INF((*this), "Setting telemetry rate to %d", rate);
         telemetry_rate_hz = rate;
     }
+
     if (props->Exists("vehicle.ardupilot.autoheading")) {
         auto yes = props->Get("vehicle.ardupilot.autoheading");
 
@@ -3275,50 +3784,83 @@ Ardupilot_vehicle::Configure()
             VEHICLE_LOG_INF((*this), "Autoheading is off.");
         }
     }
+    if (props->Exists("vehicle.ardupilot.ignore_speed_in_route")) {
+        auto yes = props->Get("vehicle.ardupilot.ignore_speed_in_route");
+
+        if (yes == "no") {
+            ignore_speed_in_route = false;
+        } else if (yes == "yes") {
+            ignore_speed_in_route = true;
+        } else {
+            LOG_ERR("Invalid value '%s' for ignore_speed_in_route", yes.c_str());
+        }
+
+        if (ignore_speed_in_route) {
+            VEHICLE_LOG_INF((*this), "ignore_speed_in_route is on.");
+        } else {
+            VEHICLE_LOG_INF((*this), "ignore_speed_in_route is off.");
+        }
+    }
+    if (props->Exists("vehicle.ardupilot.disable_mission_download")) {
+        auto yes = props->Get("vehicle.ardupilot.disable_mission_download");
+
+        if (yes == "no") {
+            disable_mission_download = false;
+        } else if (yes == "yes") {
+            disable_mission_download = true;
+        } else {
+            LOG_ERR("Invalid value '%s' for disable_mission_download", yes.c_str());
+        }
+
+        if (disable_mission_download) {
+            VEHICLE_LOG_INF((*this), "Mission download is disabled.");
+        } else {
+            VEHICLE_LOG_INF((*this), "Mission download is enabled.");
+        }
+    }
 }
 
 void
 Ardupilot_vehicle::Update_capability_states()
 {
     c_manual->Set_enabled(!Is_control_mode(proto::CONTROL_MODE_MANUAL));
-    c_disarm->Set_enabled(Is_armed() && !is_airborne);
     c_emergency_land->Set_enabled(Is_armed());
-    c_takeoff_command->Set_enabled(Is_armed() && !is_airborne);
 
     // servo commands are always enabled.
     c_set_servo->Set_enabled(true);
     c_repeat_servo->Set_enabled(true);
+    c_camera_trigger_command->Set_enabled(true);
 
-    // Calibration possible only while on the ground.
+    // Calibration and reboot possible only while disarmed on the ground.
     c_trigger_calibration->Set_enabled(!Is_armed() && !is_airborne);
-
-    // Calibration possible only while on the ground.
     c_trigger_reboot->Set_enabled(!Is_armed() && !is_airborne);
 
+    // Takeoff and disarm is valid only while armed and on the ground.
+    c_takeoff_command->Set_enabled(Is_armed() && !is_airborne);
+    c_disarm->Set_enabled(Is_armed() && !is_airborne);
+
+    // Set heading, RTH, land, waypoint valid only when airborne.
+    c_set_heading->Set_enabled(Is_armed() && is_airborne);
+    c_set_relative_heading->Set_enabled(Is_armed() && is_airborne);
+    c_rth->Set_enabled(Is_armed() && is_airborne);
+    c_land_command->Set_enabled(Is_armed() && is_airborne);
+    c_waypoint->Set_enabled(Is_armed() && is_airborne);
+
     if (Is_armed() && is_airborne) {
-        c_waypoint->Set_enabled(true);
         c_auto->Set_enabled(!Is_flight_mode(proto::FLIGHT_MODE_WAYPOINTS) && !Is_flight_mode(proto::FLIGHT_MODE_HOLD));
         c_guided->Set_enabled(!Is_control_mode(proto::CONTROL_MODE_CLICK_GO));
-        c_land_command->Set_enabled(true);
         c_pause->Set_enabled(!Is_control_mode(proto::CONTROL_MODE_MANUAL) && !Is_flight_mode(proto::FLIGHT_MODE_HOLD));
-        // - Disable resume when flight mode is auto except when in HOLD mode.
-        // - Disable resume while on last mission item
-        c_resume->Set_enabled(
-                (!Is_control_mode(proto::CONTROL_MODE_AUTO) || Is_flight_mode(proto::FLIGHT_MODE_HOLD))
-            &&  !Is_current_command_last());
+        // Disable resume when flight mode is auto except when in HOLD mode.
+        c_resume->Set_enabled(!Is_control_mode(proto::CONTROL_MODE_AUTO) || Is_flight_mode(proto::FLIGHT_MODE_HOLD));
         c_joystick->Set_enabled(!Is_control_mode(proto::CONTROL_MODE_JOYSTICK));
-        c_direct_vehicle_control->Set_enabled(Is_control_mode(proto::CONTROL_MODE_JOYSTICK));
-        c_rth->Set_enabled(true);
         c_arm->Set_enabled(false);
+        c_direct_vehicle_control->Set_enabled(Is_control_mode(proto::CONTROL_MODE_JOYSTICK));
     } else {
-        c_waypoint->Set_enabled(false);
         c_auto->Set_enabled(Is_armed());
         c_guided->Set_enabled(false);
-        c_land_command->Set_enabled(false);
         c_joystick->Set_enabled(false);
         c_pause->Set_enabled(false);
         c_resume->Set_enabled(false);
-        c_rth->Set_enabled(false);
         c_arm->Set_enabled(!Is_armed() && !Is_control_mode(proto::CONTROL_MODE_AUTO));
         c_direct_vehicle_control->Set_enabled(false);
     }
@@ -3328,8 +3870,9 @@ Ardupilot_vehicle::Update_capability_states()
 const char*
 Ardupilot_vehicle::Get_native_flight_mode_name(int mode)
 {
-    switch (Get_type()) {
-    case Type::COPTER:
+    switch (Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_HELICOPTER:
         switch (static_cast<Copter_flight_mode>(mode)) {
         case Copter_flight_mode::STABILIZE:
             return "STABILIZE";
@@ -3359,29 +3902,22 @@ Ardupilot_vehicle::Get_native_flight_mode_name(int mode)
             return "FLIP";
         case Copter_flight_mode::AUTOTUNE:
             return "AUTOTUNE";
+        case Copter_flight_mode::POSHOLD:
+            return "POSHOLD";
+        case Copter_flight_mode::BRAKE:
+            return "BRAKE";
+        case Copter_flight_mode::THROW:
+            return "THROW";
+        case Copter_flight_mode::AVOID_ADSB:
+            return "AVOID_ADSB";
+        case Copter_flight_mode::GUIDED_NOGPS:
+            return "GUIDED_NOGPS";
+        case Copter_flight_mode::SMART_RTL:
+            return "SMART_RTL";
         }
         break;
-    case Type::ROVER:
-        switch (static_cast<Rover_flight_mode>(mode)) {
-        case Rover_flight_mode::MANUAL:
-            return "MANUAL";
-        case Rover_flight_mode::LEARNING:
-            return "LEARNING";
-        case Rover_flight_mode::STEERING:
-            return "STEERING";
-        case Rover_flight_mode::HOLD:
-            return "HOLD";
-        case Rover_flight_mode::AUTO:
-            return "AUTO";
-        case Rover_flight_mode::RTL:
-            return "RTL";
-        case Rover_flight_mode::GUIDED:
-            return "GUIDED";
-        case Rover_flight_mode::INITIALISING:
-            return "INITIALISING";
-        }
-        break;
-    case Type::PLANE:
+    case proto::VEHICLE_TYPE_FIXED_WING:
+    case proto::VEHICLE_TYPE_VTOL:
         switch (static_cast<Plane_flight_mode>(mode)) {
         case Plane_flight_mode::MANUAL:
             return "MANUAL";
@@ -3401,6 +3937,8 @@ Ardupilot_vehicle::Get_native_flight_mode_name(int mode)
             return "CRUISE";
         case Plane_flight_mode::AUTO:
             return "AUTO";
+        case Plane_flight_mode::AUTOTUNE:
+            return "AUTOTUNE";
         case Plane_flight_mode::RTL:
             return "RTL";
         case Plane_flight_mode::LOITER:
@@ -3409,28 +3947,67 @@ Ardupilot_vehicle::Get_native_flight_mode_name(int mode)
             return "GUIDED";
         case Plane_flight_mode::INITIALISING:
             return "INITIALISING";
+        case Plane_flight_mode::AVOID_ADSB:
+            return "AVOID_ADSB";
+        case Plane_flight_mode::QSTABILIZE:
+            return "QSTABILIZE";
+        case Plane_flight_mode::QHOVER:
+            return "QHOVER";
+        case Plane_flight_mode::QLOITER:
+            return "QLOITER";
+        case Plane_flight_mode::QLAND:
+            return "QLAND";
+        case Plane_flight_mode::QRTL:
+            return "QRTL";
         }
         break;
-    case Type::OTHER:
+    case proto::VEHICLE_TYPE_GROUND:
+        switch (static_cast<Rover_flight_mode>(mode)) {
+        case Rover_flight_mode::MANUAL:
+            return "MANUAL";
+        case Rover_flight_mode::ACRO:
+            return "ACRO";
+        case Rover_flight_mode::STEERING:
+            return "STEERING";
+        case Rover_flight_mode::HOLD:
+            return "HOLD";
+        case Rover_flight_mode::AUTO:
+            return "AUTO";
+        case Rover_flight_mode::RTL:
+            return "RTL";
+        case Rover_flight_mode::SMART_RTL:
+            return "SMART_RTL";
+        case Rover_flight_mode::GUIDED:
+            return "GUIDED";
+        case Rover_flight_mode::INITIALISING:
+            return "INITIALISING";
+        }
         break;
     }
     return nullptr;
 }
 
-Vehicle::Sys_status::Control_mode
-Ardupilot_vehicle::Map_control_mode(int mode)
+void
+Ardupilot_vehicle::Update_control_mode(int mode)
 {
-    switch (Get_type()) {
-    case Type::COPTER:
+    switch (Get_vehicle_type()) {
+    case proto::VEHICLE_TYPE_MULTICOPTER:
+    case proto::VEHICLE_TYPE_HELICOPTER:
         switch (static_cast<Copter_flight_mode>(mode)) {
         case Copter_flight_mode::GUIDED:
-            return Sys_status::Control_mode::GUIDED;
+        case Copter_flight_mode::GUIDED_NOGPS:
+            t_control_mode->Set_value(proto::CONTROL_MODE_CLICK_GO);
+            break;
         case Copter_flight_mode::AUTO:
         case Copter_flight_mode::RTL:
+        case Copter_flight_mode::SMART_RTL:
         case Copter_flight_mode::CIRCLE:
         case Copter_flight_mode::LAND:
         case Copter_flight_mode::AUTOTUNE:
-            return Sys_status::Control_mode::AUTO;
+        case Copter_flight_mode::BRAKE:
+        case Copter_flight_mode::THROW:
+            t_control_mode->Set_value(proto::CONTROL_MODE_AUTO);
+            break;
         case Copter_flight_mode::STABILIZE:
         case Copter_flight_mode::ACRO:
         case Copter_flight_mode::ALT_HOLD:
@@ -3439,43 +4016,57 @@ Ardupilot_vehicle::Map_control_mode(int mode)
         case Copter_flight_mode::DRIFT:
         case Copter_flight_mode::SPORT:
         case Copter_flight_mode::FLIP:
+        case Copter_flight_mode::POSHOLD:
             if (Is_rc_override_active()) {
-                return Sys_status::Control_mode::JOYSTICK;
+                t_control_mode->Set_value(proto::CONTROL_MODE_JOYSTICK);
             } else {
-                return Sys_status::Control_mode::MANUAL;
+                t_control_mode->Set_value(proto::CONTROL_MODE_MANUAL);
             }
+            break;
+        case Copter_flight_mode::AVOID_ADSB:
+            t_control_mode->Set_value_na();
+            break;
         }
         break;
-    case Type::ROVER:
+    case proto::VEHICLE_TYPE_GROUND:
         switch (static_cast<Rover_flight_mode>(mode)) {
         case Rover_flight_mode::AUTO:
         case Rover_flight_mode::RTL:
-            return Sys_status::Control_mode::AUTO;
+        case Rover_flight_mode::SMART_RTL:
+            t_control_mode->Set_value(proto::CONTROL_MODE_AUTO);
+            break;
         case Rover_flight_mode::GUIDED:
-            return Sys_status::Control_mode::GUIDED;
+            t_control_mode->Set_value(proto::CONTROL_MODE_CLICK_GO);
+            break;
         case Rover_flight_mode::MANUAL:
-        case Rover_flight_mode::LEARNING:
         case Rover_flight_mode::STEERING:
         case Rover_flight_mode::HOLD:
+        case Rover_flight_mode::ACRO:
             if (Is_rc_override_active()) {
-                return Sys_status::Control_mode::JOYSTICK;
+                t_control_mode->Set_value(proto::CONTROL_MODE_JOYSTICK);
             } else {
-                return Sys_status::Control_mode::MANUAL;
+                t_control_mode->Set_value(proto::CONTROL_MODE_MANUAL);
             }
-        case Rover_flight_mode::INITIALISING:
             break;
-        /* Fall down to unknown. */
+        case Rover_flight_mode::INITIALISING:
+            t_control_mode->Set_value_na();
         }
         break;
-    case Type::PLANE:
+    case proto::VEHICLE_TYPE_FIXED_WING:
+    case proto::VEHICLE_TYPE_VTOL:
         switch (static_cast<Plane_flight_mode>(mode)) {
         case Plane_flight_mode::AUTO:
         case Plane_flight_mode::LOITER:
         case Plane_flight_mode::CIRCLE:
         case Plane_flight_mode::RTL:
-            return Sys_status::Control_mode::AUTO;
+        case Plane_flight_mode::QLOITER:
+        case Plane_flight_mode::QRTL:
+        case Plane_flight_mode::QLAND:
+            t_control_mode->Set_value(proto::CONTROL_MODE_AUTO);
+            break;
         case Plane_flight_mode::GUIDED:
-            return Sys_status::Control_mode::GUIDED;
+            t_control_mode->Set_value(proto::CONTROL_MODE_CLICK_GO);
+            break;
         case Plane_flight_mode::MANUAL:
         case Plane_flight_mode::STABILIZE:
         case Plane_flight_mode::TRAINING:
@@ -3483,19 +4074,55 @@ Ardupilot_vehicle::Map_control_mode(int mode)
         case Plane_flight_mode::FLY_BY_WIRE_A:
         case Plane_flight_mode::FLY_BY_WIRE_B:
         case Plane_flight_mode::CRUISE:
+        case Plane_flight_mode::QSTABILIZE:
+        case Plane_flight_mode::QHOVER:
             if (Is_rc_override_active()) {
-                return Sys_status::Control_mode::JOYSTICK;
+                t_control_mode->Set_value(proto::CONTROL_MODE_JOYSTICK);
             } else {
-                return Sys_status::Control_mode::MANUAL;
+                t_control_mode->Set_value(proto::CONTROL_MODE_MANUAL);
             }
-        case Plane_flight_mode::INITIALISING:
             break;
-            /* Fall down to unknown. */
+        case Plane_flight_mode::INITIALISING:
+        case Plane_flight_mode::AVOID_ADSB:
+        case Plane_flight_mode::AUTOTUNE:
+            t_control_mode->Set_value_na();
         }
         break;
-    case Type::OTHER:
-        break;
+    default:
+        t_control_mode->Set_value_na();
     }
-    return Sys_status::Control_mode::UNKNOWN;
 }
 
+void Ardupilot_vehicle::Initialize_telemetry() {
+
+    auto p = Properties::Get_instance();
+    std::unordered_map<int, std::string> stream_list;
+
+    stream_list[mavlink::MAV_DATA_STREAM::MAV_DATA_STREAM_EXTRA1] = "EXTRA1"; // attitude
+    stream_list[mavlink::MAV_DATA_STREAM::MAV_DATA_STREAM_EXTRA2] = "EXTRA2"; // vfr_hud
+    stream_list[mavlink::MAV_DATA_STREAM::MAV_DATA_STREAM_EXTRA3] = "EXTRA3"; //vibrations
+    stream_list[mavlink::MAV_DATA_STREAM::MAV_DATA_STREAM_POSITION] = "POSITION"; //gps
+    stream_list[mavlink::MAV_DATA_STREAM::MAV_DATA_STREAM_EXTENDED_STATUS] = "EXTENDED_STATUS"; //gps fix & sysstatus
+    stream_list[mavlink::MAV_DATA_STREAM::MAV_DATA_STREAM_RC_CHANNELS] = "RC_CHANNELS"; //output pwm
+
+    for (auto it = stream_list.begin(); it != stream_list.end(); it++) {
+        mavlink::Pld_request_data_stream msg;
+        msg->target_system = real_system_id;
+        msg->target_component = real_component_id;
+        msg->req_stream_id = it->first;
+
+        std::string key = "vehicle.ardupilot.telemetry_rate." + it->second;
+        if (p->Exists(key)) {
+            msg->req_message_rate = p->Get_int(key);
+        } else {
+            msg->req_message_rate = telemetry_rate_hz;
+        }
+        VEHICLE_LOG_INF((*this), "Setting telemetry rate for %s to %d", it->second.c_str(), static_cast<int>(msg->req_message_rate));
+        msg->start_stop = 1; /* start */
+        Send_message(msg);
+        Send_message(msg);
+    }
+    // We are counting 6 messages as telemetry:
+    // SYS_STATUS, GLOBAL_POSITION_INT, ATTITUDE, VFR_HUD, GPS_RAW_INT, ALTITUDE
+    expected_telemetry_rate = telemetry_rate_hz * 6;
+}

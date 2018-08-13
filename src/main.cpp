@@ -1,4 +1,4 @@
-// Copyright (c) 2017, Smart Projects Holdings Ltd
+// Copyright (c) 2018, Smart Projects Holdings Ltd
 // All rights reserved.
 // See LICENSE file for license details.
 
@@ -19,8 +19,9 @@ void Sigint_handler(int signum __UNUSED)
 }
 #endif /* __unix__ */
 
-
 Ardupilot_vehicle_manager::Ptr manager;
+
+DEFINE_DEFAULT_VSM_NAME;
 
 int
 start_main(int argc, char *argv[])
