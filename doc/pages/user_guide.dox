@@ -2,10 +2,6 @@
 
 @page vsm_user_guide Connecting Ardupilot autopilot to UgCS
 
-@image latex ugcs-logo.png "" width=3cm
-@image latex main-vsm-logo.png "" width=3cm
-
-
 @section first_time_connecton First time vehicle connection
 
 See @ref vsm_disclaimer.
@@ -82,6 +78,27 @@ When mission includes a camera series by distance action and mission flight is i
 triggering will go on until "Continue" command is issued and vehicle reaches the next waypoint without camera trigger action.
 This is because of Ardupilot limitation which does not allow to stop camera triggering via standalone command.
 
+@section current_wp Current waypiont
+
+UgCS can report current waypoint vehicle is navigating to. There are two options available for the feature to work:
+@ref route_hash and @ref route_download. Both options are disabled by default due to their limitations.
+
+@subsection route_hash Saving route hash on vehicle
+
+When @ref route_hash_param is defined, VSM saves the hash of uploaded route to the vehicle as value of the given parameter.<br>
+Possible values: Any valid ardupilot parameter name which does not have enforced limits and is of type float.<br>
+Unfortunately, Ardupilot does not provide "user defined" parameters, therefore it is very important to select parameter which
+is not used in normal ardupilot operation. If that is not possible then @ref route_download should be considered.<br>
+Recommended parameter is RALLY_LIMIT_KM which can be used for this purpose unless "rally points" Ardupilot feature is required. 
+See @ref route_hash_param.
+
+@subsection route_download Route download
+
+When enabled, VSM downloads route from the vehicle on each vehicle connect and after each route upload to the vehicle.
+This can take significant time when the route is large.
+This setting allows to see current waypoint at the expense of doubling route upload time. It should be enabled only if
+@ref route_hash is not available. See @ref route_download_param.
+
 @section altitude Altitude
 
 Ardupilot reports two altitude types - AMSL (Above Mean Sea Level) and AHL (Above Home Location). 
@@ -146,6 +163,7 @@ TAKEOFF        |  No      | |
 LAND           |  Yes     | |
 EMERGENCYLAND  |  No      | |
 CAMERA_TRIGGER |  Yes     | See @ref camera_trigger for details|
+MISSION_CLEAR  |  Yes     | Deletes current route from vehicle|
 
 @section camera_trigger Camera trigger command
 
@@ -153,8 +171,7 @@ There are two (mutually exclusive) ways to trigger camera on Ardupilot.
 
 1) By default camera triggering done via DO_DIGICAM_CONTROL command.<br>
 This allows trigger by distance (typically used in aerial photo missions) and single shot. Trigger by time WP action is not possible with this command.<br>
-Camera interface must be configured via MissionPlanner or via "vehicle.ardupilot.parameter" settings before this command can be used.
-It is assumed that the vehicle is configured in "servo" mode (not "relay") for camera triggering.<br>
+Camera interface must be configured via MissionPlanner or via "vehicle.ardupilot.parameter" settings before this command can be used.<br>
 Make sure that SERVO*_FUNCTION is set to 10 (camera trigger).
 Please refer to Ardupilot manual for details at http://ardupilot.org/copter/docs/common-camera-shutter-with-servo.html#shutter-configuration-with-pixhawk.
 
@@ -169,6 +186,49 @@ Make sure that SERVO<camera_servo_idx>_FUNCTION is set to 0 (servo controlled by
 Both parameters RC_TRIM and SERVO_FUNCTION should be configured via MissionPlanner or via "vehicle.ardupilot.parameter" settings.
 
 3) Usage of both camera trigger actions "by time" and "by distance" in the same mission is not supported.
+
+@section autopilot_variables Autopilot parameters
+
+There is a number of MAVlink parameters which are changed on the autopilot during operation.
+Some parameters are set on first vehicle connect, some are set during route upload and command execution.
+Any mavlink parameter supported by the autopilot can be set on vehicle connect using conf file setting "vehicle.ardupilot.parameter" 
+
+@subsection common_variables Parameters common for fixed wing and copters
+
+Parameter | Description
+---|---
+GND_ALT_OFFSET  | Modified if set_ground_alt_offset is set to yes. See also @ref set_ground_alt_offset
+MIS_RESTART     | Modified during commands AUTO and CONTINUE
+RALLY_LIMIT_KM  | Used to keep the hash of uploaded route. See also @ref route_hash
+
+@subsection copter_variables Copter parameters
+
+Parameter | Description
+---|---
+BATT_FS_LOW_ACT | Modified if route parameters sets failsafe action on low battery. 
+FS_EKF_ACTION   | Modified if route parameters sets failsafe action on GPS signal loss. 
+FS_THR_ENABLE   | Modified if route parameters sets failsafe action on RC signal loss.
+RTL_ALT         | Modified if route parameters sets Emergency return altitude.
+WP_YAW_BEHAVIOR | Set to 0 if autoheading is set to yes. See also @ref heading_control
+
+@subsection plane_variables Plane and VTOL parameters
+
+Parameter | Description
+---|---
+ALT_HOLD_RTL    | Set if route parameters sets Emergency return altitude.
+TRIM_ARSPD_CM   | Modified when Click&Go command issued on the vehicle.
+LAND_FLARE_ALT  | Set if vehicle profile has "Landing flare altitude" specified. 
+LAND_FLARE_SEC  | Set if vehicle profile has "Landing flare time" specified.
+LAND_PITCH_CD   | Set if vehicle profile has "Minimum landing pitch" specified.
+TECS_LAND_DAMP  | Set if vehicle profile has "Controller sink rate to pitch gain during flare" specified.
+TECS_LAND_ARSPD | Set if vehicle profile has "Airspeed during landing approach" specified.
+TECS_LAND_SPDWGT| Set if vehicle profile has "Weighting applied to speed control during landing" specified.
+TECS_PITCH_MAX  | Set if vehicle profile has "Maximum pitch in auto flight" specified.
+LIM_PITCH_MAX   | Set if vehicle profile has "Maximum pitch" specified.
+THR_MIN         | Set if vehicle profile has "Minimum throttle" specified.
+TECS_LAND_SINK  | Set if vehicle profile has "Landing sink rate" specified.
+RNGFND_LANDING  | Set if vehicle profile has "Enable rangefinder for landing" specified.
+RNGFND_MIN_CM   | Set if vehicle profile has "Minimum rangefinder distance" specified.
 
 @section adsb_rx ADSB receiver support
 
@@ -216,6 +276,8 @@ Ardupilot reports RC link loss correctly only when throttle failsafe is activate
 
 @section fail-safe Fail-safe actions
 
+Route-specific fail safe settings can be set for ArduCopter.
+
 __GPS Lost:__
 Action		   |Result
 ---------------|-------------------|
@@ -237,6 +299,8 @@ Wait			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and
 Land			| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
 Return Home		| Aircraft changes altitude to failsafe alt. (set via MissionPlanner) and returns home|
 Continue		| Aircaft continues mission|
+
+@warning UgCS does not support failsafe settings for ArduPlane. Please use Mission Planner of QGC to modify ArduPlane failsafe settings.  
 
 __Datalink loss:__
 
@@ -382,6 +446,30 @@ For some installations GPS altitude from vehicle is more appropriate, e.g. when 
 
          vehicle.ardupilot.report_relative_altitude = no
          
+@subsection set_ground_alt_offset Set ground altitude offset
+
+Optional. By default Ardupilot VSM will set altitude offset so that uploaded Home Location altitude corresponds to reported raw altitude 0 m. 
+
+- @b Name: vehicle.ardupilot.set_ground_alt_offset
+- @b Description: Enable/Disable Setting altitude offset on route upload.
+- @b Default: yes
+- @b Example:
+
+         vehicle.ardupilot.set_ground_alt_offset = no
+         
+@subsection heading_control Vehicle heading control
+
+Optional. Forces heading to next waypoint.<br>
+yes - Change heading towards next waypoint. When set, each mission upload sets WP_YAW_BEHAVIOR to zero (yaw controlled by mission) and generates additional mission item MAV_CMD_CONDITION_YAW before each WP so that vehicle will point always to the next WP.<br> 
+no - Do not force change heading between waypoints. This disables override of parameter WP_YAW_BEHAVIOR on mission upload. So the vehicle heading control is defined by current setting of WP_YAW_BEHAVIOR.
+
+- @b Name: vehicle.ardupilot.autoheading
+- @b Description: Enable/Disable generation of automatic heading change to next WP during route upload.
+- @b Default: yes
+- @b Example:
+
+         vehicle.ardupilot.autoheading = no
+         
 @subsection telem_rate Telemetry rate configuration
 
 Ardupilot VSM supports setting custom telemetry rate to manage datalink channel bandwidth.
@@ -391,7 +479,7 @@ Rate of 1 produces ~350 bytes/sec of telemetry traffic.
 - @b Required: No.
 - @b Supported @b values: 1 - 50
 - @b Default: 2
-- @b Description: Set update fequency for vehicle state information (attitude, position, battery, etc...)
+- @b Description: Set update frequency for vehicle state information (attitude, position, battery, etc...)
 - @b Example:
 
         vehicle.ardupilot.telemetry_rate = 1
@@ -419,7 +507,39 @@ The prefix mavlink_injection supports all the same syntax as "connection" prefix
 - @b Default: Not set.
 - @b Example:
 
-        mavlink_injection.udp_any.1.local_port = 44444
+        mavlink.injection.udp_any.1.local_port = 44444
+
+@subsection mavlink_sysid Mavlink System ID
+
+MAVlink System ID used for outgoing MAVlink messages.
+
+- @b Required: No.
+- @b Supported @b values: 1 - 254
+- @b Default: 1.
+- @b Example:
+
+        mavlink.vsm_system_id = 100
+
+@subsection route_download_param Enable route download
+
+Enable route download from the vehicle. See @ref route_download for details. 
+
+- @b Required: No.
+- @b Supported @b values: yes/no
+- @b Default: no
+- @b Example:
+
+        vehicle.ardupilot.enable_route_download = yes
+
+@subsection route_hash_param Route hash parameter name
+
+Enable saving of route hash on the vehicle. See @ref route_hash for details. 
+- @b Required: No.
+- @b Supported @b values: yes/no
+- @b Default: Not set.
+- @b Example:
+
+        vehicle.ardupilot.route_hash_parameter = RALLY_LIMIT_KM
 
 @subsection disarm_delay DISARM_DELAY parameter
 

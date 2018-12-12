@@ -12,7 +12,7 @@
 #include <adsb_aircraft.h>
 
 #define ARDUPILOT_VERSION(maj, min, patch) ((maj << 24) + (min << 16) + (patch << 8))
-#define DISARM_MAGIC_VALUE 21196.0f 
+#define DISARM_MAGIC_VALUE 21196.0f
 
 /** Vehicle supporting Ardupilot specific flavor of Mavlink. */
 class Ardupilot_vehicle : public Mavlink_vehicle {
@@ -21,34 +21,50 @@ class Ardupilot_vehicle : public Mavlink_vehicle {
 public:
     template<typename... Args>
     Ardupilot_vehicle(
-            ugcs::vsm::Mavlink_demuxer::System_id system_id,
-            ugcs::vsm::Mavlink_demuxer::Component_id component_id,
-            ugcs::vsm::mavlink::MAV_TYPE type,
-            ugcs::vsm::Io_stream::Ref stream,
-            ugcs::vsm::Optional<std::string> mission_dump_path,
-            const std::string& serial,
-            const std::string& model,
-            Args &&... args) :
+        ugcs::vsm::Mavlink_demuxer::System_id system_id,
+        ugcs::vsm::Mavlink_demuxer::Component_id component_id,
+        ugcs::vsm::mavlink::MAV_TYPE type,
+        ugcs::vsm::Mavlink_stream::Ptr stream,
+        ugcs::vsm::Optional<std::string> mission_dump_path,
+        const std::string& serial,
+        const std::string& model,
+        Args &&... args) :
             Mavlink_vehicle(
-                    system_id,
-                    component_id,
-                    Vendor::ARDUPILOT,
-                    type,
-                    stream,
-                    mission_dump_path,
-                    serial,
-                    model,
-                    std::forward<Args>(args)...),
+                system_id,
+                component_id,
+                Vendor::ARDUPILOT,
+                type,
+                stream,
+                mission_dump_path,
+                serial,
+                model,
+                std::forward<Args>(args)...),
             vehicle_command(*this),
             task_upload(*this)
     {
         Set_autopilot_type("ardupilot");
+        switch (Get_vehicle_type()) {
+        case ugcs::vsm::proto::VEHICLE_TYPE_FIXED_WING:
+            Set_model_name("ArduPlane");
+            break;
+        case ugcs::vsm::proto::VEHICLE_TYPE_HELICOPTER:
+        case ugcs::vsm::proto::VEHICLE_TYPE_MULTICOPTER:
+            Set_model_name("ArduCopter");
+            break;
+        case ugcs::vsm::proto::VEHICLE_TYPE_GROUND:
+            Set_model_name("ArduRover");
+            break;
+        case ugcs::vsm::proto::VEHICLE_TYPE_VTOL:
+            Set_model_name("ArduVTOL");
+            break;
+        }
 
         /* Consider this as uptime start. */
         recent_connect = std::chrono::steady_clock::now();
-        Configure();
-        Update_capabilities();
     }
+
+    // Constructor for command processor.
+    Ardupilot_vehicle(ugcs::vsm::proto::Vehicle_type type);
 
     virtual void
     On_enable();
@@ -69,13 +85,6 @@ public:
 
         /** Managed Ardupilot vehicle. */
         Ardupilot_vehicle& ardu_vehicle;
-
-        /** new style command request. */
-        ugcs::vsm::Ucs_request::Ptr ucs_request = nullptr;
-
-        /** Disable the activity. */
-        void
-        Disable(const std::string& status);
     };
 
     /** Data related to vehicle command processing. */
@@ -129,9 +138,6 @@ public:
         /** Disable the activity. */
         virtual void
         On_disable() override;
-
-        void
-        Disable_success();
 
         /** Schedule timer for retry operation. */
         void
@@ -235,6 +241,9 @@ public:
         Process_reboot();
 
         void
+        Process_mission_clear();
+
+        void
         Process_calibration();
 
         void
@@ -258,6 +267,10 @@ public:
         // throws if a parameter is invalid (not float).
         void
         Process_write_parameter(const ugcs::vsm::Property_list& params);
+
+        // throws if a parameter is invalid (not float).
+        void
+        Process_set_poi(const ugcs::vsm::Property_list& params);
 
         void
         Process_emergency_land();
@@ -371,7 +384,7 @@ public:
 
         /** Previous activity is completed, enable class and start task upload. */
         void
-        Enable();
+        Enable(bool generate_file);
 
         /** Disable this class and cancel any existing request. */
         virtual void
@@ -457,7 +470,7 @@ public:
          * requirements. Example is adding of magical "dummy waypoints" and
          * special processing of waypoint zero.
          */
-        std::vector<ugcs::vsm::mavlink::Payload_base::Ptr> prepared_actions;
+        ugcs::vsm::mavlink::Payload_list prepared_actions;
 
         /** Task attributes to be written to the vehicle. */
         Write_parameters::List task_attributes;
@@ -495,8 +508,8 @@ public:
              camera_series_by_time_active_in_wp = false;
 
         float altitude_origin = 0;
-        float safe_altitude = 0;
         float home_altitude = 0;
+        bool use_crlf_in_native_route = false;
 
         int current_route_command_index = -1;  // for command map
         float command_count = 0; // for progress reporting
@@ -536,7 +549,7 @@ public:
     On_mission_request(int seq);
 
     void
-    Report_home_location(double lat, double lon, float alt);
+    Report_home_location(double lat, double lon, double alt);
 
     void
     On_home_position(
@@ -551,6 +564,11 @@ public:
 
     bool
     On_adsb_vehicles_timer();
+
+protected:
+    /** Load parameters from configuration. */
+    void
+    Configure_common();
 
 private:
     /** Flight modes of the Ardupilot Copter mode. Copied from ArduCopter/defines.h*/
@@ -644,15 +662,12 @@ private:
     void
     Update_capability_states();
 
-    /** Load parameters from configuration. */
+    /** Load parameters from configuration for real vehicle */
     void
-    Configure();
+    Configure_real_vehicle();
 
     void
     Get_home_location();
-
-    void
-    Download_mission();
 
     bool
     Is_home_position_valid();
@@ -825,8 +840,11 @@ private:
     // workaround for cases when user does not want to have set_speed on each WP.
     bool ignore_speed_in_route = false;
 
-    // disable mission download after upload. Downlad may take too much time for large missions
-    bool disable_mission_download = false;
+    // disable route download after upload. Download may take too much time for large missions.
+    // This effectively disables the "Current WP" feature.
+    bool enable_route_download = false;
+
+    std::string route_hash_parameter;
 
     // Onboard transponder type if configured.
     ugcs::vsm::Optional<int> adsb_transponder_type;
