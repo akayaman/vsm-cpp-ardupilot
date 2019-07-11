@@ -110,6 +110,10 @@ Ardupilot_vehicle::On_enable()
         &Ardupilot_vehicle::On_string_parameter,
         this);
 
+    common_handlers.Register_mavlink_handler<mavlink::apm::MESSAGE_ID::RANGEFINDER, mavlink::apm::Extension>(
+        &Ardupilot_vehicle::On_rangefinder,
+        this);
+
     common_handlers.Register_mavlink_handler<mavlink::sph::SPH_ADSB_TRANSPONDER_STATE, mavlink::sph::Extension>(
         &Ardupilot_vehicle::On_adsb_state,
         this);
@@ -434,6 +438,14 @@ Ardupilot_vehicle::On_autopilot_version(mavlink::Pld_autopilot_version ver)
         names.emplace(route_hash_parameter);
     }
 
+    if ((ver->capabilities & mavlink::MAV_PROTOCOL_CAPABILITY_MAVLINK2)
+        && !mav_stream->Is_mavlink_v2()
+        && !use_mavlink_2)
+    {
+        mav_stream->Set_mavlink_v2(true);
+        VEHICLE_LOG_DBG(*this, "Enabled MAVLINK2");
+    }
+
     read_parameters.Enable(std::move(names));
 
     /* Disable HOME_POSITION support because SITL does not report it if connected via UDP.
@@ -458,6 +470,16 @@ Ardupilot_vehicle::On_version_processed(bool success, std::string)
     if (!success && !Is_registered()) {
         // If there is no answer to AUTOPILOT_VERSION_REQUEST register as is.
         Register();
+    }
+}
+
+void
+Ardupilot_vehicle::On_rangefinder(
+        mavlink::Message<mavlink::apm::MESSAGE_ID::RANGEFINDER, mavlink::apm::Extension>::Ptr message)
+{
+    if (!message->payload->distance.Is_reset()) {
+        t_altitude_agl->Set_value(message->payload->distance.Get());
+        Commit_to_ucs();
     }
 }
 
@@ -2628,7 +2650,7 @@ Ardupilot_vehicle::Task_upload::Prepare_mission(const proto::Device_command& vsm
     last_move_params.Disengage();
     current_route_command_index = 0;
     auto takeoff_present = false;
-    Optional<Property_list> prev_camera_params;
+    Property_list prev_camera_params;
     for (int i = 0; i < vsm_cmd.sub_commands_size(); i++) {
         auto vsm_scmd = vsm_cmd.sub_commands(i);
         auto cmd = vehicle.Get_command(vsm_scmd.command_id());
@@ -2671,27 +2693,17 @@ Ardupilot_vehicle::Task_upload::Prepare_mission(const proto::Device_command& vsm
         } else if (cmd == vehicle.c_set_servo) {
             Prepare_set_servo(params);
         } else if (cmd == vehicle.c_camera_by_distance) {
-            if (prev_camera_params) {
-                if ((*prev_camera_params).Is_equal(params)) {
-                    // Skip generating camera action if it is the same as previous.
-                    camera_series_by_dist_active_in_wp = true;
-                } else {
-                    Prepare_camera_series_by_distance(params);
-                    prev_camera_params = params;
-                }
+            if (prev_camera_params.Is_equal(params) && camera_series_by_dist_active) {
+                // Skip generating camera action if it is the same as previous.
+                camera_series_by_dist_active_in_wp = true;
             } else {
                 Prepare_camera_series_by_distance(params);
                 prev_camera_params = params;
             }
         } else if (cmd == vehicle.c_camera_by_time) {
-            if (prev_camera_params) {
-                if ((*prev_camera_params).Is_equal(params)) {
-                    // Skip generating camera action if it is the same as previous.
-                    camera_series_by_time_active_in_wp = true;
-                } else {
-                    Prepare_camera_series_by_time(params);
-                    prev_camera_params = params;
-                }
+            if (prev_camera_params.Is_equal(params) && camera_series_by_time_active) {
+                // Skip generating camera action if it is the same as previous.
+                camera_series_by_time_active_in_wp = true;
             } else {
                 Prepare_camera_series_by_time(params);
                 prev_camera_params = params;
@@ -3020,12 +3032,12 @@ Ardupilot_vehicle::Task_upload::Prepare_move(const Property_list& params)
 
     auto mi = Build_wp_mission_item(params);
     if (last_move_params) {
-        auto last_pos = Create_mission_item_with_coords(*last_move_params);
-        auto from = Wgs84_position(Geodetic_tuple((*last_pos)->x, (*last_pos)->y, (*last_pos)->z));
-        auto to = Wgs84_position(Geodetic_tuple((*mi)->x, (*mi)->y, (*mi)->z));
-        float calculated_heading = from.Bearing(to);
-        // Handle several waypoints at the same coords.
-        if (!std::isnan(calculated_heading)) {
+        auto from = Wgs84_position(Create_geodetic_tuple(*last_move_params));
+        auto to = Wgs84_position(Create_geodetic_tuple(params));
+        if (    fabs(from.Get_geodetic().latitude - to.Get_geodetic().latitude) > 0.00000001
+            ||  fabs(from.Get_geodetic().longitude - to.Get_geodetic().longitude) > 0.00000001) {
+            // Handle several waypoints at the same coords.
+            float calculated_heading = from.Bearing(to);
             calculated_heading = Normalize_angle_0_2pi(calculated_heading);
             heading_to_this_wp = calculated_heading;
         } else {
@@ -3072,7 +3084,6 @@ Ardupilot_vehicle::Task_upload::Prepare_move(const Property_list& params)
 void
 Ardupilot_vehicle::Task_upload::Prepare_wait(const Property_list& params)
 {
-    /* Create additional waypoint on the current position to wait. */
     if (last_move_params) {
         first_mission_poi_set = false;
         restart_mission_poi = true;
@@ -3084,8 +3095,7 @@ Ardupilot_vehicle::Task_upload::Prepare_wait(const Property_list& params)
         case proto::VEHICLE_TYPE_MULTICOPTER:
         case proto::VEHICLE_TYPE_HELICOPTER:
             if (!current_mission_poi && ardu_vehicle.autoheading) {
-                Add_mission_item(Build_heading_mission_item(
-                    Normalize_angle_0_2pi(current_heading)));
+                Add_mission_item(Build_heading_mission_item(Normalize_angle_0_2pi(current_heading)));
             }
             if (wait_time < 0) {
                 (*wp)->command = mavlink::MAV_CMD::MAV_CMD_NAV_LOITER_UNLIM;
@@ -4002,15 +4012,6 @@ Ardupilot_vehicle::Configure_real_vehicle()
             }
         }
 
-    }
-
-    if (props->Exists("mavlink.vsm_system_id")) {
-        int sid = props->Get_int("mavlink.vsm_system_id");
-        if (sid > 0 && sid < 255) {
-            vsm_system_id = sid;
-        } else {
-            VEHICLE_LOG_ERR((*this), "Invalid value '%d' for vsm_system_id", sid);
-        }
     }
 }
 

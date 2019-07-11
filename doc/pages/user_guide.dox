@@ -495,31 +495,6 @@ Use this to disable all speed changes defined in route. Vehicle will fly with de
 
         vehicle.ardupilot.ignore_speed_in_route = yes
 
-@subsection mavlink_injection Mavlink message injection
-
-Ardupilot VSM can receive mavlink packets and forward them to the vehicle if vehicle with specified target_id is connected. It can be used to send GPS RTK corrections to vehicles.
-If message has no target_id or traget_id is 0 then it is sent to all connected vehicles.
-Supported messages are: COMMAND_LONG, COMMAND_INT, GPS_INJECT_DATA and GPS_RTCM_DATA. 
-The prefix mavlink_injection supports all the same syntax as "connection" prefix.
-
-- @b Required: No.
-- @b Supported @b values: Same as those for connection prefix.
-- @b Default: Not set.
-- @b Example:
-
-        mavlink.injection.udp_any.1.local_port = 44444
-
-@subsection mavlink_sysid Mavlink System ID
-
-MAVlink System ID used for outgoing MAVlink messages.
-
-- @b Required: No.
-- @b Supported @b values: 1 - 254
-- @b Default: 1.
-- @b Example:
-
-        mavlink.vsm_system_id = 100
-
 @subsection route_download_param Enable route download
 
 Enable route download from the vehicle. See @ref route_download for details. 
@@ -540,6 +515,48 @@ Enable saving of route hash on the vehicle. See @ref route_hash for details.
 - @b Example:
 
         vehicle.ardupilot.route_hash_parameter = RALLY_LIMIT_KM
+
+
+@subsection mavlink_injection Mavlink message injection
+
+Ardupilot VSM can receive mavlink packets and forward them to the vehicle if vehicle with specified target_id is connected. It can be used to send GPS RTK corrections to vehicles.
+If message has no target_id or traget_id is 0 then it is sent to all connected vehicles.
+Supported messages are: COMMAND_LONG, COMMAND_INT, GPS_INJECT_DATA and GPS_RTCM_DATA. 
+The prefix mavlink_injection supports all the same syntax as "connection" prefix.
+
+- @b Required: No.
+- @b Supported @b values: Same as those for connection prefix.
+- @b Default: Not set.
+- @b Example:
+
+        mavlink.injection.udp_any.1.local_port = 44444
+
+
+@subsection mavlink_sysid Mavlink System ID
+
+MAVlink System ID used for outgoing MAVlink messages.
+
+- @b Required: No.
+- @b Supported @b values: 1 - 254
+- @b Default: 1.
+- @b Example:
+
+        mavlink.vsm_system_id = 100
+
+
+@subsection protocol_version Mavlink protocol version
+
+MAVlink Protocol version used for messages generated on VSM. There are three options:<br>
+1 - Always use MAVLINK1 (default)<br>
+2 - Always use MAVLINK2<br>
+auto - Detect autopilot capabilities and use MAVLINK2 if autopilot reports MAV_PROTOCOL_CAPABILITY_MAVLINK2<br>
+
+- @b Required: No.
+- @b Supported @b values: 1, 2, auto
+- @b Default: 1
+- @b Example:
+
+        mavlink.protocol_version = 2
 
 @subsection disarm_delay DISARM_DELAY parameter
 

@@ -61,6 +61,8 @@ public:
 
         /* Consider this as uptime start. */
         recent_connect = std::chrono::steady_clock::now();
+
+        use_mavlink_2 = false;  // Default to mavlink 1 for ardupilot.
     }
 
     // Constructor for command processor.
@@ -532,6 +534,10 @@ public:
 
     void
     On_parameter(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::PARAM_VALUE>::Ptr);
+
+    void
+    On_rangefinder(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::apm::MESSAGE_ID::RANGEFINDER,
+        ugcs::vsm::mavlink::apm::Extension>::Ptr);
 
     void
     On_adsb_vehicle(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::ADSB_VEHICLE>::Ptr);
