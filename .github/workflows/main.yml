@@ -1,0 +1,22 @@
+name: CI
+
+on: [push]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: build
+      run: |
+        make update_ci
+        docker-compose run --rm windows-dev ./windows/build.sh
+    - name: Upload artifact
+      uses: actions/upload-artifact@v1.0.0
+      with:
+        name: vsm-ardupilot-windows.zip
+        path: |
+          build/windows/vsm-ardupilot.*
+          build/windows/*.dll
