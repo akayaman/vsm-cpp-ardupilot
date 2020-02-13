@@ -1,0 +1,33 @@
+!.gitkeep
+
+# IDE exclusions
+.DS_Store
+Thumbs.db
+.idea
+_ide_helper.php
+.phpstorm.meta.php
+*.sqlite
+.rocketeer/
+.vscode/
+.buildpath
+.project
+.settings/
+.classpath
+.metadata/
+.cproject
+storage/
+
+Testing/
+build/
+bin/
+*.log
+.env
+.gradle/
+.m2/
+/.apt_generated/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+

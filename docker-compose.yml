@@ -1,0 +1,18 @@
+version: '2.1'
+services:
+  windows-dev:
+    image: nakayamaatsushi/fq1150-vsm-build-windows:${WINDOWS_TAG}
+    volumes:
+      - ".:/home/build"
+      - "../vsm-cpp-common:/home/vsm-cpp-common"
+    ports:
+      - "15555"
+      - "1991/udp"
+  linux-dev:
+    image: nakayamaatsushi/fq1150-vsm-build-linux:${LINUX_TAG}
+    volumes:
+      - ".:/home/build"
+      - "../vsm-cpp-common:/home/vsm-cpp-common"
+    ports:
+      - "15555"
+      - "1991/udp"
