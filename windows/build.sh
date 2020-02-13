@@ -3,6 +3,13 @@
 SRC_DIR=$(pwd)
 mkdir -p build/windows
 cd build/windows
+
+cp /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll .
+cp /usr/lib/gcc/x86_64-w64-mingw32/7.3-posix/libstdc++-6.dll .
+cp /usr/lib/gcc/x86_64-w64-mingw32/7.3-posix/libgcc_s_seh-1.dll .
+cp /usr/x86_64-w64-mingw32/bin/ssleay32.dll .
+cp /usr/x86_64-w64-mingw32/bin/libeay32.dll .
+
 rm -rf *
 cmake \
   -DCMAKE_TOOLCHAIN_FILE=${SRC_DIR}/toolchain.mingw.cmake \
