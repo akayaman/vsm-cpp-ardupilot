@@ -3,6 +3,14 @@ vsm-cpp-ardupilot
 
 C++11 VSM for Ardupilot autopilot implemented using SDK of [Universal ground Control Software](http://www.ugcs.com/ "UgCS").
 
+# Preparation
+
+```
+git clone git@github.com:akayaman/vsm-cpp-ardupilot.git
+git clone git@github.com:ugcs/vsm-cpp-common.git
+cd vsm-cpp-ardupilot
+```
+
 # Build the development environment as a Docker image
 
 At first, you build the development environment as a Docker image.
@@ -46,7 +54,7 @@ docker-compose run --rm windows-dev bash
 
 Then, you would get `build/windows/vsm-ardupilot.exe`.
 
-### Visual Studio Codeを使ったC++開発
+### C++ development with Visual Studio Code
 
 1. Run the following commands in your host OS.
 
