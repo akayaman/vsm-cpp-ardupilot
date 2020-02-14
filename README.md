@@ -20,7 +20,7 @@ The Docker image include some tools like gcc or cmake and VSM SDK.
 make ci_image
 ```
 
-# Buld VSM
+# Build VSM
 
 ## for Linux
 
