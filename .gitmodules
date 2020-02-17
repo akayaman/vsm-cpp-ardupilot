@@ -1,0 +1,3 @@
+[submodule "vsm-cpp-common"]
+	path = vsm-cpp-common
+	url = https://github.com/ugcs/vsm-cpp-common.git
