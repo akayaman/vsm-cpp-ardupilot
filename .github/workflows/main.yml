@@ -1,0 +1,26 @@
+name: CI
+
+on: [push]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - uses: srt32/git-actions@v0.0.3
+      with:
+        args: git submodule update --init --recursive
+    - name: build
+      run: |
+        make update_ci
+        docker-compose run --rm windows-dev ./windows/build.sh
+        mkdir dist
+        cp build/windows/*.dll dist
+        cp build/windows/vsm-ardupilot* dist
+    - name: Upload artifact
+      uses: actions/upload-artifact@v1.0.0
+      with:
+        name: vsm-ardupilot-windows.zip
+        path: dist

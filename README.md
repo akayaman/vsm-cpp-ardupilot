@@ -6,8 +6,7 @@ C++11 VSM for Ardupilot autopilot implemented using SDK of [Universal ground Con
 # Preparation
 
 ```
-git clone git@github.com:sensyn-robotics/vsm-cpp-ardupilot.git
-git clone git@github.com:ugcs/vsm-cpp-common.git
+git clone --recursive git@github.com:sensyn-robotics/vsm-cpp-ardupilot.git
 cd vsm-cpp-ardupilot
 ```
 
