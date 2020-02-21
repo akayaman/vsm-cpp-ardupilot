@@ -1,18 +1,13 @@
-version: '2.1'
+version: '3.7'
 services:
   windows-dev:
     image: nakayamaatsushi/fq1150-vsm-build-windows:${WINDOWS_TAG}
     volumes:
       - ".:/home/build"
-      - "../vsm-cpp-common:/home/vsm-cpp-common"
-    ports:
-      - "15555"
-      - "1991/udp"
   linux-dev:
     image: nakayamaatsushi/fq1150-vsm-build-linux:${LINUX_TAG}
     volumes:
       - ".:/home/build"
-      - "../vsm-cpp-common:/home/vsm-cpp-common"
     ports:
-      - "15555"
-      - "1991/udp"
+      - "0.0.0.0:14550:14550/udp"
+    command: "bash -c 'cd build/linux && mkdir -p /opt/vsm-sdk/linux/var/opt/vsm-ardupilot/log/mission && ./vsm-ardupilot'"

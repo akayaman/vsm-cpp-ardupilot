@@ -282,7 +282,7 @@ public:
         Generate_wp_from_current_position();
 
         void
-        Process_camera_trigger();
+        Process_camera_trigger(const ugcs::vsm::Property_list& params);
 
         // Stop camera trigger by time/distance if active.
         void
@@ -820,6 +820,9 @@ private:
     // How many 0,0,0,0 rc_override messages to send to exit joystick mode.
     constexpr static size_t RC_OVERRIDE_END_COUNT = 15;
 
+    constexpr static int MAV_CMD_DO_GRIPPER = 211;
+    constexpr static int GRIPPER_ACTION_RELEASE = 0;
+
     ugcs::vsm::Property::Ptr t_adsb_altitude_internal;
     ugcs::vsm::Property::Ptr t_adsb_transponder_mode;
     ugcs::vsm::Property::Ptr t_adsb_altitude;
@@ -871,6 +874,72 @@ private:
 
     // Autopilot version
     uint32_t ardupilot_version = 0;
+
+    struct OptionalConfig {
+        struct Gripper {
+            int servoId = -99999;
+            int pwm = -99999;
+            int index = 1;
+        } gripper;
+
+        struct Zoom {
+            int servoId = 12;
+            int zoomIn = 1685;
+            int zoomStop = 1514;
+            int zoomOut = 1050;
+            int resetTime = 4;
+            double ratio = 1;
+        } zoom;
+
+        struct Camera {
+            int servoId = 11;
+            int startShootingPwm = 1500;
+            int startRecordingPwm = 1900;
+            int stopPwm = 1100;
+            int shootingDelay = 3;
+        } camera;
+    } optionalConfig;
+
+    template <typename T> void Set_servo(T item, int pwm) const
+    {
+        (*item)->command = ugcs::vsm::mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
+        (*item)->param1 = optionalConfig.camera.servoId;
+        (*item)->param2 = pwm;
+    }
+
+    template <typename T> void Set_zoom(T item, int pwm) const
+    {
+        (*item)->command = ugcs::vsm::mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
+        (*item)->param1 = optionalConfig.zoom.servoId;
+        (*item)->param2 = pwm;
+    }
+
+    template <typename T> void Set_delay(T item, int delay) const
+    {
+        (*item)->command = ugcs::vsm::mavlink::MAV_CMD::MAV_CMD_NAV_DELAY;
+        (*item)->param1 = delay;
+    }
+
+    template <typename T> void Set_shoot_delay(T item) const
+    {
+        Set_delay(item, optionalConfig.camera.shootingDelay);
+    }
+
+    void updateConfig(const char* propName, int& ref)
+    {
+        auto props = ugcs::vsm::Properties::Get_instance().get();
+        if (props->Exists(propName)) {
+            ref = props->Get_int(propName);
+        }
+    }
+
+    void updateConfig(const char* propName, double& ref)
+    {
+        auto props = ugcs::vsm::Properties::Get_instance().get();
+        if (props->Exists(propName)) {
+            ref = props->Get_float(propName);
+        }
+    }
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */
