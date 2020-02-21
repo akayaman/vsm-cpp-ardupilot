@@ -18,10 +18,22 @@ template <typename T> void Set_servo(T item, int pwm)
     (*item)->param2 = pwm;
 }
 
-template <typename T> void Set_shoot_delay(T item)
+template <typename T> void Set_zoom(T item, int pwm)
+{
+    (*item)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
+    (*item)->param1 = 12;
+    (*item)->param2 = pwm;
+}
+
+template <typename T> void Set_delay(T item, int delay)
 {
     (*item)->command = mavlink::MAV_CMD::MAV_CMD_NAV_DELAY;
-    (*item)->param1 = 3;
+    (*item)->param1 = delay;
+}
+
+template <typename T> void Set_shoot_delay(T item)
+{
+    Set_delay(item, 3);
 }
 
 // Constructor for command processor.
@@ -3239,6 +3251,37 @@ Ardupilot_vehicle::Task_upload::Prepare_payload_control(const Property_list& par
     (*mi)->param3 = tmp * 180.0 / M_PI;
     (*mi)->z = mavlink::MAV_MOUNT_MODE::MAV_MOUNT_MODE_MAVLINK_TARGETING;
     Add_mission_item(mi);
+
+    if (params.Get_value("zoom_level", tmp)) {
+        // set zoom level zero.
+        {
+            auto mi = Create_mission_item();
+            Set_zoom(mi, 1200);
+            Add_mission_item(mi);
+        }
+        {
+            auto mi = Create_mission_item();
+            Set_delay(mi, 3);
+            Add_mission_item(mi);
+        }
+
+        // set zoom level the required value.
+        {
+            auto mi = Create_mission_item();
+            Set_zoom(mi, 1800);
+            Add_mission_item(mi);
+        }
+        {
+            auto mi = Create_mission_item();
+            Set_delay(mi, 0.3 * tmp);
+            Add_mission_item(mi);
+        }
+        {
+            auto mi = Create_mission_item();
+            Set_zoom(mi, 1514);
+            Add_mission_item(mi);
+        }
+    }
 }
 
 void
