@@ -37,6 +37,12 @@ docker-compose run --rm linux-dev bash
 
 Then, you would get `build/linux/vsm-ardupilot`.
 
+### Run VSM
+
+```shell
+docker-compose up -d
+```
+
 ## for Windows
 
 ### Run the Docker container as the development environment
