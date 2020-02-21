@@ -11,6 +11,19 @@ constexpr std::chrono::milliseconds Ardupilot_vehicle::RC_OVERRIDE_TIMEOUT;
 constexpr std::chrono::seconds Ardupilot_vehicle::HL_POLLING_PERIOD;
 constexpr std::chrono::seconds Ardupilot_vehicle::ADSB_VEHICLE_TIMEOUT;
 
+template <typename T> void Set_servo(T item, int pwm)
+{
+    (*item)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
+    (*item)->param1 = 11;
+    (*item)->param2 = pwm;
+}
+
+template <typename T> void Set_shoot_delay(T item)
+{
+    (*item)->command = mavlink::MAV_CMD::MAV_CMD_NAV_DELAY;
+    (*item)->param1 = 3;
+}
+
 // Constructor for command processor.
 Ardupilot_vehicle::Ardupilot_vehicle(proto::Vehicle_type type):
         Mavlink_vehicle(Vendor::ARDUPILOT, "ardupilot", type),
@@ -55,6 +68,7 @@ Ardupilot_vehicle::On_enable()
 
     // Get parameter values.
     Mavlink_vehicle::On_enable();
+
     read_version.version_handler = Read_version::Make_version_handler(
         &Ardupilot_vehicle::On_autopilot_version,
         Shared_from_this());
@@ -1212,7 +1226,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
         } else if (cmd == vehicle.c_guided) {
             Process_guided();
         } else if (cmd == vehicle.c_camera_trigger_command) {
-            Process_camera_trigger();
+            Process_camera_trigger(params);
         } else if (cmd == vehicle.c_direct_vehicle_control) {
             Process_direct_vehicle_control(params);
         } else if (cmd == vehicle.c_write_parameter) {
@@ -2079,19 +2093,38 @@ Ardupilot_vehicle::Vehicle_command_act::Process_rth()
 }
 
 void
-Ardupilot_vehicle::Vehicle_command_act::Process_camera_trigger()
+Ardupilot_vehicle::Vehicle_command_act::Process_camera_trigger(const ugcs::vsm::Property_list& params)
 {
     auto cmd_long = mavlink::Pld_command_long::Create();
     Fill_target_ids(*cmd_long);
-    if (ardu_vehicle.camera_servo_idx == -1) {
-        (*cmd_long)->command = mavlink::MAV_CMD_DO_DIGICAM_CONTROL;
-        (*cmd_long)->param5 = 1;
-    } else {
-        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-        (*cmd_long)->param1 = ardu_vehicle.camera_servo_idx;
-        (*cmd_long)->param2 = ardu_vehicle.camera_servo_pwm;
-        (*cmd_long)->param3 = 1;  // do it once
-        (*cmd_long)->param4 = ardu_vehicle.camera_servo_time;
+
+    int state;
+    params.Get_value("state", state);
+    switch (state) {
+    case proto::CAMERA_COMMAND_TRIGGER_STATE_SINGLE_SHOT:
+        {
+            auto c = mavlink::Pld_command_long::Create();
+            Fill_target_ids(*c);
+            Set_servo(c, 1500);
+            cmd_messages.emplace_back(c);
+        }
+        {
+            auto c = mavlink::Pld_command_long::Create();
+            Fill_target_ids(*c);
+            Set_shoot_delay(c);
+            cmd_messages.emplace_back(c);
+        }
+        Set_servo(cmd_long, 1100);
+        break;
+    case proto::CAMERA_COMMAND_TRIGGER_STATE_VIDEO_START:
+        Set_servo(cmd_long, 1900);
+        break;
+    case proto::CAMERA_COMMAND_TRIGGER_STATE_VIDEO_STOP:
+        Set_servo(cmd_long, 1100);
+        break;
+    default:
+        VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
+        return;
     }
     cmd_messages.emplace_back(cmd_long);
 }
@@ -3355,27 +3388,32 @@ Ardupilot_vehicle::Task_upload::Prepare_camera_trigger(const Property_list& para
     int state;
     params.Get_value("state", state);
 
+    switch (state) {
+    case proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO:
+        Add_camera_trigger_item();
+        break;
+    case proto::CAMERA_MISSION_TRIGGER_STATE_ON:
+        {
+            auto mi = Create_mission_item();
+            Set_servo(mi, 1900);
+            Add_mission_item(mi);
+        }
+        break;
+    case proto::CAMERA_MISSION_TRIGGER_STATE_OFF:
+        {
+            auto mi = Create_mission_item();
+            Set_servo(mi, 1100);
+            Add_mission_item(mi);
+        }
+        break;
+    default:
+        VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
+        return;
+    }
     if (state != proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO &&
         state != proto::CAMERA_MISSION_TRIGGER_STATE_SERIAL_PHOTO) {
         VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
         return;
-    }
-    if (state == proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO) {
-        Add_camera_trigger_item();
-    } else {
-        if (ardu_vehicle.camera_servo_idx == -1) {
-            VEHICLE_LOG_WRN(vehicle, "Command repeat_trigger ignored.");
-            return;
-        }
-        auto mi = Create_mission_item();
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-        (*mi)->param1 = ardu_vehicle.camera_servo_idx;
-        (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
-        (*mi)->param3 = 32767;    // infinity packed in signed short.
-        (*mi)->param4 = ardu_vehicle.camera_servo_time;
-        camera_series_by_time_active = true;
-        camera_series_by_time_active_in_wp = true;
-        Add_mission_item(mi);
     }
 }
 
@@ -3571,18 +3609,21 @@ Ardupilot_vehicle::Task_upload::Build_heading_mission_item(
 void
 Ardupilot_vehicle::Task_upload::Add_camera_trigger_item()
 {
-    auto mi = Create_mission_item();
-    if (ardu_vehicle.camera_servo_idx == -1) {
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_DIGICAM_CONTROL;
-        (*mi)->x = 1;
-    } else {
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-        (*mi)->param1 = ardu_vehicle.camera_servo_idx;
-        (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
-        (*mi)->param3 = 1;  // do it once
-        (*mi)->param4 = ardu_vehicle.camera_servo_time;
+    {
+        auto mi = Create_mission_item();
+        Set_servo(mi, 1500);
+        Add_mission_item(mi);
     }
-    Add_mission_item(mi);
+    {
+        auto mi = Create_mission_item();
+        Set_shoot_delay(mi);
+        Add_mission_item(mi);
+    }
+    {
+        auto mi = Create_mission_item();
+        Set_servo(mi, 1100);
+        Add_mission_item(mi);
+    }
 }
 
 mavlink::Pld_mission_item::Ptr

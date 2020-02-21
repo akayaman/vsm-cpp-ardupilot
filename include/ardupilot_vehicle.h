@@ -282,7 +282,7 @@ public:
         Generate_wp_from_current_position();
 
         void
-        Process_camera_trigger();
+        Process_camera_trigger(const ugcs::vsm::Property_list& params);
 
         // Stop camera trigger by time/distance if active.
         void
