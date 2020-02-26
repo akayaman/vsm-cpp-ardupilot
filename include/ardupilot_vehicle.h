@@ -10,6 +10,7 @@
 
 #include <mavlink_vehicle.h>
 #include <adsb_aircraft.h>
+#include <payload_protocol.h>
 
 #define ARDUPILOT_VERSION(maj, min, patch) ((maj << 24) + (min << 16) + (patch << 8))
 #define DISARM_MAGIC_VALUE 21196.0f
@@ -69,13 +70,13 @@ public:
     Ardupilot_vehicle(ugcs::vsm::proto::Vehicle_type type);
 
     virtual void
-    On_enable();
+    On_enable() override;
 
     virtual void
-    On_disable();
+    On_disable() override;
 
     virtual void
-    Handle_ucs_command(ugcs::vsm::Ucs_request::Ptr ucs_request);
+    Handle_ucs_command(ugcs::vsm::Ucs_request::Ptr ucs_request) override;
 
     /** Ardupilot specific activity. */
     class Ardupilot_activity : public Activity {
@@ -87,6 +88,20 @@ public:
 
         /** Managed Ardupilot vehicle. */
         Ardupilot_vehicle& ardu_vehicle;
+    };
+
+    /** Data related to specific payload subsystem */
+    struct PayloadSubsystem {
+        PayloadSubsystem(uint8_t payloadId) : payloadId(payloadId) {}
+
+        uint8_t payloadId;
+        ugcs::vsm::Subsystem::Ptr subsystem;
+
+        ugcs::vsm::Property::Ptr t_payload_status_b64;
+        ugcs::vsm::Property::Ptr t_payload_data_b64;
+        ugcs::vsm::Property::Ptr t_payload_value_b64;
+
+        ugcs::vsm::Vsm_command::Ptr c_payload_command;
     };
 
     /** Data related to vehicle command processing. */
@@ -287,6 +302,9 @@ public:
         // Stop camera trigger by time/distance if active.
         void
         Stop_camera_series();
+
+        void
+        Process_payload_command(PayloadSubsystem &payload_subsystem, const ugcs::vsm::Property_list& params);
     } vehicle_command;
 
 
@@ -310,7 +328,7 @@ public:
          * @return Created mission item. */
 
         void
-        Prepare_move(const ugcs::vsm::Property_list&);
+        Prepare_move(const ugcs::vsm::Property_list&, bool is_last = false);
 
         void
         Prepare_wait(const ugcs::vsm::Property_list&);
@@ -520,6 +538,9 @@ public:
         float total_count = 0; // for progress reporting
         // home location
         ugcs::vsm::Property_list hl_params;
+
+        // Index of last move command in mission. Used to force straight turn-type for it.
+        int last_move_idx = 0;
     } task_upload;
 
 
@@ -541,6 +562,9 @@ public:
 
     void
     On_adsb_vehicle(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::ADSB_VEHICLE>::Ptr);
+
+    void
+    On_v2_extension(ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::V2_EXTENSION>::Ptr);
 
     void
     On_string_parameter(
@@ -648,7 +672,7 @@ private:
             ugcs::vsm::mavlink::Message<ugcs::vsm::mavlink::MESSAGE_ID::HEARTBEAT>::Ptr) override;
 
     virtual void
-    Initialize_telemetry();
+    Initialize_telemetry() override;
 
     /** Map custom flight mode from the heartbeat to our flight mode. */
     void
@@ -772,6 +796,14 @@ private:
      */
     bool gnd_alt_offset_allow = false;
 
+    /** Configuration for communications with custom payload onboard computer */
+    struct CustomPayloadConfiguration {
+        bool enable = false;
+        uint8_t system_id = ugcs::vsm::mavlink::SYSTEM_ID_NONE;
+        uint8_t component_id = ugcs::vsm::mavlink::MAV_COMP_ID_ALL;
+        uint8_t network = 0;
+    } custom_payload;
+
     /** Poll for home location until it is nonzero. */
     ugcs::vsm::Timer_processor::Timer::Ptr home_location_timer;
 
@@ -856,7 +888,7 @@ private:
     ugcs::vsm::Optional<int> adsb_transponder_type;
 
     virtual bool
-    Verify_parameter(const std::string& name, float value, ugcs::vsm::mavlink::MAV_PARAM_TYPE& type);
+    Verify_parameter(const std::string& name, float value, ugcs::vsm::mavlink::MAV_PARAM_TYPE& type) override;
 
     ugcs::vsm::Optional<float> current_alt_offset;
 
@@ -871,6 +903,23 @@ private:
 
     // Autopilot version
     uint32_t ardupilot_version = 0;
+
+    ugcs::vsm::Subsystem::Ptr obsolete_gpr;
+    PayloadSubsystem payload_gpr = PayloadSubsystem(0);
+    PayloadSubsystem payload_magnetometer = PayloadSubsystem(1);
+    PayloadSubsystem payload_gas_analyzer = PayloadSubsystem(2);
+
+    PayloadSubsystem* payload_subsystems[3] = {
+        &payload_gpr,
+        &payload_magnetometer,
+        &payload_gas_analyzer
+    };
+
+    // Custom Payload commands dispatcher
+    Protocol::Modern::Logic::MessageDispatcher custom_payload_dispatcher;
+
+    ugcs::vsm::mavlink::Payload_base::Ptr
+    Prepare_v2_custom_payload_message(const std::vector<uint8_t>& commandBytes);
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */

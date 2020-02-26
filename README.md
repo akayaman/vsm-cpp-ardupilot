@@ -1,5 +1,5 @@
 vsm-cpp-ardupilot
 ===========
 
-C++11 VSM for Ardupilot autopilot implemented using SDK of [Universal ground Control Software](http://www.ugcs.com/ "UgCS").
+VSM for Ardupilot autopilot implemented using VSM-SDK of [Universal ground Control Software](http://www.ugcs.com/ "UgCS").
 

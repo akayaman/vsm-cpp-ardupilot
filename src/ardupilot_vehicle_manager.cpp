@@ -31,16 +31,16 @@ Ardupilot_vehicle_manager::Register_detectors()
         Shared_from_this());
 
     /* Patterns below are known to appear during Ardupilot booting process. */
-    Add_timeout_extension_pattern(regex::regex("Init Ardu"));
-    Add_timeout_extension_pattern(regex::regex("Free RAM:"));
-    Add_timeout_extension_pattern(regex::regex("start interactive setup"));
-    Add_timeout_extension_pattern(regex::regex("Demo Servos"));
-    Add_timeout_extension_pattern(regex::regex("Init Gyro"));
-    Add_timeout_extension_pattern(regex::regex("Initialising APM"));
-    Add_timeout_extension_pattern(regex::regex("barometer calibration"));
-    Add_timeout_extension_pattern(regex::regex("Calibrating barometer"));
-    Add_timeout_extension_pattern(regex::regex("load_al"));
-    Add_timeout_extension_pattern(regex::regex("GROUND START"));
+    Add_timeout_extension_pattern(std::regex("Init Ardu"));
+    Add_timeout_extension_pattern(std::regex("Free RAM:"));
+    Add_timeout_extension_pattern(std::regex("start interactive setup"));
+    Add_timeout_extension_pattern(std::regex("Demo Servos"));
+    Add_timeout_extension_pattern(std::regex("Init Gyro"));
+    Add_timeout_extension_pattern(std::regex("Initialising APM"));
+    Add_timeout_extension_pattern(std::regex("barometer calibration"));
+    Add_timeout_extension_pattern(std::regex("Calibrating barometer"));
+    Add_timeout_extension_pattern(std::regex("load_al"));
+    Add_timeout_extension_pattern(std::regex("GROUND START"));
 
     vtol_processor->Enable();
     copter_processor->Enable();
