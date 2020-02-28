@@ -871,6 +871,56 @@ private:
 
     // Autopilot version
     uint32_t ardupilot_version = 0;
+
+    struct OptionalConfig {
+        struct Gripper {
+            int servoId = -99999;
+            int pwm = -99999;
+            int index = 1;
+        } gripper;
+
+        struct Zoom {
+            int servoId = 12;
+            int zoomIn = 1800;
+            int zoomStop = 1514;
+            int zoomOut = 1200;
+            int resetTime = 3;
+            double ratio = 0.3;
+        } zoom;
+
+        struct Camera {
+            int servoId = 11;
+            int startShootingPwm = 1500;
+            int startRecordingPwm = 1900;
+            int stopPwm = 1100;
+            int ShootingDelay = 3;
+        } camera;
+    } optionalConfig;
+
+    template <typename T> void Set_servo(T item, int pwm) const
+    {
+        (*item)->command = ugcs::vsm::mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
+        (*item)->param1 = optionalConfig.camera.servoId;
+        (*item)->param2 = pwm;
+    }
+
+    template <typename T> void Set_zoom(T item, int pwm) const
+    {
+        (*item)->command = ugcs::vsm::mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
+        (*item)->param1 = optionalConfig.zoom.servoId;
+        (*item)->param2 = pwm;
+    }
+
+    template <typename T> void Set_delay(T item, int delay) const
+    {
+        (*item)->command = ugcs::vsm::mavlink::MAV_CMD::MAV_CMD_NAV_DELAY;
+        (*item)->param1 = delay;
+    }
+
+    template <typename T> void Set_shoot_delay(T item) const
+    {
+        Set_delay(item, optionalConfig.camera.ShootingDelay);
+    }
 };
 
 #endif /* _ARDUPILOT_VEHICLE_H_ */

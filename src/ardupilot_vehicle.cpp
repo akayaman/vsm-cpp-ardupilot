@@ -11,30 +11,12 @@ constexpr std::chrono::milliseconds Ardupilot_vehicle::RC_OVERRIDE_TIMEOUT;
 constexpr std::chrono::seconds Ardupilot_vehicle::HL_POLLING_PERIOD;
 constexpr std::chrono::seconds Ardupilot_vehicle::ADSB_VEHICLE_TIMEOUT;
 
-template <typename T> void Set_servo(T item, int pwm)
-{
-    (*item)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
-    (*item)->param1 = 11;
-    (*item)->param2 = pwm;
-}
+static constexpr int DO_GRIPPER_SERVO_ID = -99999;
+static constexpr int DO_GRIPPER_SERVO_PWM = -99999;
+static constexpr int GRIPPER_INDEX = 1;
 
-template <typename T> void Set_zoom(T item, int pwm)
-{
-    (*item)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
-    (*item)->param1 = 12;
-    (*item)->param2 = pwm;
-}
-
-template <typename T> void Set_delay(T item, int delay)
-{
-    (*item)->command = mavlink::MAV_CMD::MAV_CMD_NAV_DELAY;
-    (*item)->param1 = delay;
-}
-
-template <typename T> void Set_shoot_delay(T item)
-{
-    Set_delay(item, 3);
-}
+static constexpr int MAV_CMD_DO_GRIPPER = 211;
+static constexpr int GRIPPER_ACTION_RELEASE = 0;
 
 // Constructor for command processor.
 Ardupilot_vehicle::Ardupilot_vehicle(proto::Vehicle_type type):
@@ -1656,9 +1638,15 @@ Ardupilot_vehicle::Vehicle_command_act::Process_set_servo(const Property_list& p
     Fill_target_ids(*cmd_long);
     params.Get_value("servo_id", servo_id);
     params.Get_value("pwm", pwm);
-    (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_SERVO;
-    (*cmd_long)->param1 = servo_id;
-    (*cmd_long)->param2 = pwm;
+    if (servo_id == DO_GRIPPER_SERVO_ID && pwm == DO_GRIPPER_SERVO_PWM) {
+        (*cmd_long)->command = MAV_CMD_DO_GRIPPER;
+        (*cmd_long)->param1 = GRIPPER_INDEX;
+        (*cmd_long)->param2 = GRIPPER_ACTION_RELEASE;
+    } else {
+        (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_SERVO;
+        (*cmd_long)->param1 = servo_id;
+        (*cmd_long)->param2 = pwm;
+    }
     cmd_messages.emplace_back(cmd_long);
 }
 
@@ -2112,27 +2100,28 @@ Ardupilot_vehicle::Vehicle_command_act::Process_camera_trigger(const ugcs::vsm::
 
     int state;
     params.Get_value("state", state);
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
     switch (state) {
     case proto::CAMERA_COMMAND_TRIGGER_STATE_SINGLE_SHOT:
         {
             auto c = mavlink::Pld_command_long::Create();
             Fill_target_ids(*c);
-            Set_servo(c, 1500);
+            veh.Set_servo(c, veh.optionalConfig.camera.startShootingPwm);
             cmd_messages.emplace_back(c);
         }
         {
             auto c = mavlink::Pld_command_long::Create();
             Fill_target_ids(*c);
-            Set_shoot_delay(c);
+            veh.Set_shoot_delay(c);
             cmd_messages.emplace_back(c);
         }
-        Set_servo(cmd_long, 1100);
+        veh.Set_servo(cmd_long, veh.optionalConfig.camera.stopPwm);
         break;
     case proto::CAMERA_COMMAND_TRIGGER_STATE_VIDEO_START:
-        Set_servo(cmd_long, 1900);
+        veh.Set_servo(cmd_long, veh.optionalConfig.camera.startRecordingPwm);
         break;
     case proto::CAMERA_COMMAND_TRIGGER_STATE_VIDEO_STOP:
-        Set_servo(cmd_long, 1100);
+        veh.Set_servo(cmd_long, veh.optionalConfig.camera.stopPwm);
         break;
     default:
         VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
@@ -3253,32 +3242,33 @@ Ardupilot_vehicle::Task_upload::Prepare_payload_control(const Property_list& par
     Add_mission_item(mi);
 
     if (params.Get_value("zoom_level", tmp)) {
+        const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
         // set zoom level zero.
         {
             auto mi = Create_mission_item();
-            Set_zoom(mi, 1200);
+            veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomOut);
             Add_mission_item(mi);
         }
         {
             auto mi = Create_mission_item();
-            Set_delay(mi, 3);
+            veh.Set_delay(mi, veh.optionalConfig.zoom.resetTime);
             Add_mission_item(mi);
         }
 
         // set zoom level the required value.
         {
             auto mi = Create_mission_item();
-            Set_zoom(mi, 1800);
+            veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomIn);
             Add_mission_item(mi);
         }
         {
             auto mi = Create_mission_item();
-            Set_delay(mi, 0.3 * tmp);
+            veh.Set_delay(mi, veh.optionalConfig.zoom.ratio * tmp);
             Add_mission_item(mi);
         }
         {
             auto mi = Create_mission_item();
-            Set_zoom(mi, 1514);
+            veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomStop);
             Add_mission_item(mi);
         }
     }
@@ -3431,6 +3421,7 @@ Ardupilot_vehicle::Task_upload::Prepare_camera_trigger(const Property_list& para
     int state;
     params.Get_value("state", state);
 
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
     switch (state) {
     case proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO:
         Add_camera_trigger_item();
@@ -3438,14 +3429,14 @@ Ardupilot_vehicle::Task_upload::Prepare_camera_trigger(const Property_list& para
     case proto::CAMERA_MISSION_TRIGGER_STATE_ON:
         {
             auto mi = Create_mission_item();
-            Set_servo(mi, 1900);
+            veh.Set_servo(mi, veh.optionalConfig.camera.startRecordingPwm);
             Add_mission_item(mi);
         }
         break;
     case proto::CAMERA_MISSION_TRIGGER_STATE_OFF:
         {
             auto mi = Create_mission_item();
-            Set_servo(mi, 1100);
+            veh.Set_servo(mi, veh.optionalConfig.camera.stopPwm);
             Add_mission_item(mi);
         }
         break;
@@ -3652,19 +3643,20 @@ Ardupilot_vehicle::Task_upload::Build_heading_mission_item(
 void
 Ardupilot_vehicle::Task_upload::Add_camera_trigger_item()
 {
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
     {
         auto mi = Create_mission_item();
-        Set_servo(mi, 1500);
+        veh.Set_servo(mi, veh.optionalConfig.camera.startShootingPwm);
         Add_mission_item(mi);
     }
     {
         auto mi = Create_mission_item();
-        Set_shoot_delay(mi);
+        veh.Set_shoot_delay(mi);
         Add_mission_item(mi);
     }
     {
         auto mi = Create_mission_item();
-        Set_servo(mi, 1100);
+        veh.Set_servo(mi, veh.optionalConfig.camera.stopPwm);
         Add_mission_item(mi);
     }
 }
