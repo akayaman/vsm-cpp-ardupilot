@@ -296,7 +296,9 @@ public:
         Task_upload(Ardupilot_vehicle& vehicle):
             Ardupilot_activity(vehicle),
             task_attributes(vehicle.real_system_id, vehicle.real_component_id)
-        {}
+        {
+            LOG_INFO("Task_upload component ID : %d", vehicle.real_component_id);
+        }
 
         /** Add mission item to prepared actions. Common mission item
          * initialization are made, like sequence number generation.
