@@ -4012,6 +4012,21 @@ Ardupilot_vehicle::Configure_common()
             VEHICLE_LOG_INF((*this), "ignore_speed_in_route is off.");
         }
     }
+
+    updateConfig("vehicle.fq1150.gripper.servo_id", optionalConfig.gripper.servoId);
+    updateConfig("vehicle.fq1150.gripper.pwm", optionalConfig.gripper.pwm);
+    updateConfig("vehicle.fq1150.gripper.index", optionalConfig.gripper.index);
+    updateConfig("vehicle.fq1150.zoom.servo_id", optionalConfig.zoom.servoId);
+    updateConfig("vehicle.fq1150.zoom.in.pwm", optionalConfig.zoom.zoomIn);
+    updateConfig("vehicle.fq1150.zoom.stop.pwm", optionalConfig.zoom.zoomStop);
+    updateConfig("vehicle.fq1150.zoom.out.pwm", optionalConfig.zoom.zoomOut);
+    updateConfig("vehicle.fq1150.zoom.reset_time", optionalConfig.zoom.resetTime);
+    updateConfig("vehicle.fq1150.zoom.ratio", optionalConfig.zoom.ratio);
+    updateConfig("vehicle.fq1150.camera.servo_id", optionalConfig.camera.servoId);
+    updateConfig("vehicle.fq1150.camera.shooting.pwm", optionalConfig.camera.startShootingPwm);
+    updateConfig("vehicle.fq1150.camera.shooting.delay", optionalConfig.camera.shootingDelay);
+    updateConfig("vehicle.fq1150.camera.recording.pwm", optionalConfig.camera.startRecordingPwm);
+    updateConfig("vehicle.fq1150.camera.stop.pwm", optionalConfig.camera.stopPwm);
 }
 
 void

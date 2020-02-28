@@ -893,7 +893,7 @@ private:
             int startShootingPwm = 1500;
             int startRecordingPwm = 1900;
             int stopPwm = 1100;
-            int ShootingDelay = 3;
+            int shootingDelay = 3;
         } camera;
     } optionalConfig;
 
@@ -919,7 +919,23 @@ private:
 
     template <typename T> void Set_shoot_delay(T item) const
     {
-        Set_delay(item, optionalConfig.camera.ShootingDelay);
+        Set_delay(item, optionalConfig.camera.shootingDelay);
+    }
+
+    void updateConfig(const char* propName, int& ref)
+    {
+        auto props = ugcs::vsm::Properties::Get_instance().get();
+        if (props->Exists(propName)) {
+            ref = props->Get_int(propName);
+        }
+    }
+
+    void updateConfig(const char* propName, double& ref)
+    {
+        auto props = ugcs::vsm::Properties::Get_instance().get();
+        if (props->Exists(propName)) {
+            ref = props->Get_float(propName);
+        }
     }
 };
 
