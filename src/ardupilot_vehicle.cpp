@@ -11,12 +11,8 @@ constexpr std::chrono::milliseconds Ardupilot_vehicle::RC_OVERRIDE_TIMEOUT;
 constexpr std::chrono::seconds Ardupilot_vehicle::HL_POLLING_PERIOD;
 constexpr std::chrono::seconds Ardupilot_vehicle::ADSB_VEHICLE_TIMEOUT;
 
-static constexpr int DO_GRIPPER_SERVO_ID = -99999;
-static constexpr int DO_GRIPPER_SERVO_PWM = -99999;
-static constexpr int GRIPPER_INDEX = 1;
-
-static constexpr int MAV_CMD_DO_GRIPPER = 211;
-static constexpr int GRIPPER_ACTION_RELEASE = 0;
+constexpr int Ardupilot_vehicle::MAV_CMD_DO_GRIPPER;
+constexpr int Ardupilot_vehicle::GRIPPER_ACTION_RELEASE;
 
 // Constructor for command processor.
 Ardupilot_vehicle::Ardupilot_vehicle(proto::Vehicle_type type):
@@ -1638,9 +1634,10 @@ Ardupilot_vehicle::Vehicle_command_act::Process_set_servo(const Property_list& p
     Fill_target_ids(*cmd_long);
     params.Get_value("servo_id", servo_id);
     params.Get_value("pwm", pwm);
-    if (servo_id == DO_GRIPPER_SERVO_ID && pwm == DO_GRIPPER_SERVO_PWM) {
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    if (servo_id == veh.optionalConfig.gripper.servoId && pwm == veh.optionalConfig.gripper.pwm) {
         (*cmd_long)->command = MAV_CMD_DO_GRIPPER;
-        (*cmd_long)->param1 = GRIPPER_INDEX;
+        (*cmd_long)->param1 = veh.optionalConfig.gripper.index;
         (*cmd_long)->param2 = GRIPPER_ACTION_RELEASE;
     } else {
         (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_SERVO;

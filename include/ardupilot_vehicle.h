@@ -820,6 +820,9 @@ private:
     // How many 0,0,0,0 rc_override messages to send to exit joystick mode.
     constexpr static size_t RC_OVERRIDE_END_COUNT = 15;
 
+    constexpr static int MAV_CMD_DO_GRIPPER = 211;
+    constexpr static int GRIPPER_ACTION_RELEASE = 0;
+
     ugcs::vsm::Property::Ptr t_adsb_altitude_internal;
     ugcs::vsm::Property::Ptr t_adsb_transponder_mode;
     ugcs::vsm::Property::Ptr t_adsb_altitude;
