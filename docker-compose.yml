@@ -10,4 +10,4 @@ services:
       - ".:/home/build"
     ports:
       - "0.0.0.0:14550:14550/udp"
-    command: "bash -c 'cd build/linux && mkdir -p /opt/vsm-sdk/linux/log && ./vsm-ardupilot'"
+    command: "bash -c 'cd build/linux && mkdir -p /opt/vsm-sdk/linux/var/opt/vsm-ardupilot/log/mission && ./vsm-ardupilot'"
