@@ -60,23 +60,26 @@ Supported Ardupilot firmware versions:
 __Mission action support:__
 Flight plan element / action | Support | Notes
 -----------------------------|---------|---------
-Change speed    |  Partial | Changing of flight speed during the mission may work only on latest 3.3.x firmware.
+Change speed    |  Partial | Changing of flight speed during the mission may work only on latest 3.3.x firmware. See also note on speed below.
 Panorama        |  Partial | Only clock-wise movement is supported due to Ardupilot firmware bug. UgCS provides correct angle values according to Mavlink specification.
 Set camera mode |  Partial | Only photo mode is supported. See @ref camera_trigger |
 Set camera by time | Partial | "First shot delay" parameter is not supported. See note below. |
 Set camera by distance | Partial | Only "Distance" parameter is supported. See note below. |
-Set camera attitude | No | |
+Set camera attitude | Yes | |
 Set POI | Yes | |
 Change yaw | Yes | |
 
-@note __Camera series by time and by distance__<br>
+@subsection trig_by_dist_note1 Camera series by time and by distance
 When mission includes a camera series (by time or by distance) action and mission flight is interrupted by issuing any command that interferes with mission (eg. Hold, Click&Go, RTH) during active camera series then
 triggering will stop until vehicle reaches the next waypoint with camera trigger action.
 
-@note __Camera series by distance on ArduCopter prior version 3.6__<br>
+@subsection trig_by_dist_note2 Camera series by distance on ArduCopter prior version 3.6
 When mission includes a camera series by distance action and mission flight is interrupted by issuing any command that interferes with mission (eg. Hold, Click&Go, RTH) during active camera series then
 triggering will go on until "Continue" command is issued and vehicle reaches the next waypoint without camera trigger action.
 This is because of Ardupilot limitation which does not allow to stop camera triggering via standalone command.
+
+@subsection speed_mission_note Speed changes in mission
+When transiting into route segment with lower required speed autopilot sometimes lowers the speed too much. This is autopilot inefficiency which can be worked around by avoiding large speed differences between waypoints.
 
 @section current_wp Current waypiont
 
@@ -159,7 +162,7 @@ JOYSTICK       |  Yes     | Sets _Joystick mode_. See also @ref joystick below. 
 HOLD           |  Yes     | Pause mission execution. The drone will loiter at its current position. |
 CONTINUE       |  Yes     | Continue with mission execution from next waypoint. Works from _Manual_, _Joystick_ and _Click&Go_ modes. If mission is already completed then vehicle will restart the mission.|
 RETURN HOME    |  Yes     | Vehicle will return to home location. See also @ref home_location. |
-TAKEOFF        |  No      | |
+TAKEOFF        |  Yes     | |
 LAND           |  Yes     | |
 EMERGENCYLAND  |  No      | |
 CAMERA_TRIGGER |  Yes     | See @ref camera_trigger for details|
@@ -537,11 +540,23 @@ The prefix mavlink_injection supports all the same syntax as "connection" prefix
 MAVlink System ID used for outgoing MAVlink messages.
 
 - @b Required: No.
-- @b Supported @b values: 1 - 254
-- @b Default: 1.
+- @b Supported @b values: 1 - 255
+- @b Default: 255.
 - @b Example:
 
         mavlink.vsm_system_id = 100
+
+
+@subsection mavlink_compid Mavlink Component ID
+
+MAVlink Component ID used for outgoing MAVlink messages.
+
+- @b Required: No.
+- @b Supported @b values: 0 - 255
+- @b Default: 0
+- @b Example:
+
+        mavlink.vsm_component_id = 190
 
 
 @subsection protocol_version Mavlink protocol version

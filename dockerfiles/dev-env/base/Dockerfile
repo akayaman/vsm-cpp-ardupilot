@@ -11,6 +11,11 @@ RUN \
         curl \
         iputils-ping \
         net-tools \
+        libtool \
+        unzip \
+        wget \
+        bison \
+        flex \
         && \
     ln -s /usr/bin/python2.7 /usr/bin/python \
         && \

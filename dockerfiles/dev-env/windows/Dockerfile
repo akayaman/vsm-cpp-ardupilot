@@ -5,7 +5,9 @@ FROM nakayamaatsushi/fq1150-vsm-build-linux:${LINUX_IMAGE_MD5} AS linux-image
 FROM nakayamaatsushi/fq1150-vsm-build-base:${BASE_IMAGE_MD5}
 
 COPY toolchain.mingw.cmake /tmp
-COPY --from=linux-image /opt/vsm-sdk/linux/opt/vsm-sdk/share/tools/protobuf_compiler /usr/local/bin/
+COPY --from=linux-image /usr/local/bin/protoc /usr/local/bin/
+COPY --from=linux-image /usr/local/lib/libprotoc.so.9 /usr/local/lib/
+COPY --from=linux-image /usr/local/lib/libprotobuf.so.9 /usr/local/lib/
 
 RUN \
 # install tools
@@ -20,11 +22,8 @@ RUN \
         gcc-mingw-w64-x86-64 \
         g++-mingw-w64-x86-64 \
         win-iconv-mingw-w64-dev \
-        wget \
-        gcc \
         automake \
-        bison \
-        flex \
+        autoconf \
         pkg-config \
         && \
 # configure the settings of the thread model to the POSIX one.
@@ -50,6 +49,78 @@ RUN \
     ln -s /usr/x86_64-w64-mingw32/include/aclapi.h /usr/x86_64-w64-mingw32/include/Aclapi.h \
         && \
     ln -s /usr/x86_64-w64-mingw32/include/ws2tcpip.h /usr/x86_64-w64-mingw32/include/WS2tcpip.h \
+        && \
+# google test
+    cd /tmp \
+        && \
+    wget https://github.com/google/googletest/archive/release-1.8.1.tar.gz \
+        && \
+    tar -xvf release-1.8.1.tar.gz \
+        && \
+    cd googletest-release-1.8.1/ \
+        && \
+    mkdir build \
+        && \
+    cd build \
+        && \
+    cmake .. \
+        && \
+    make \
+        && \
+    make install \
+        && \
+# install protobuf
+    cd /tmp \
+        && \
+    git clone https://github.com/protocolbuffers/protobuf.git \
+        && \
+    cd protobuf \
+        && \
+    git checkout v2.6.1 \
+        && \
+    git submodule update --init --recursive \
+        && \
+    sed -e s/"curl http:\/\/googletest.googlecode.com\/files\/gtest-1.5.0.tar.bz2 | tar jx"/"curl -L https:\/\/github.com\/google\/googletest\/archive\/release-1.5.0.tar.gz | tar zx"/ -i ./autogen.sh \
+        && \
+    sed -e s/"mv gtest-1.5.0 gtest"/"mv googletest-release-1.5.0 gtest"/ -i ./autogen.sh \
+        && \
+    ./autogen.sh \
+        && \
+    ./configure --host=x86_64-w64-mingw32 \
+        && \
+    (make || true) \
+        && \
+    rm -f ./src/protoc.exe \
+        && \
+    ln -s /usr/local/bin/protoc ./src/protoc.exe \
+        && \
+    touch ./src/protoc.exe \
+        && \
+    ldconfig \
+        && \
+    make install \
+        && \
+    ldconfig \
+        && \
+    ln -s /usr/local/lib/libprotoc.a /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotoc.dll.a /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotoc.la /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotoc.so.9 /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotobuf.a /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotobuf-lite.dll.a /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotobuf.la /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotobuf-lite.la /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotobuf.dll.a /usr/x86_64-w64-mingw32/lib/ \
+        && \
+    ln -s /usr/local/lib/libprotobuf-lite.a /usr/x86_64-w64-mingw32/lib/ \
         && \
 # install zlib for Windows.
     cd /tmp \
@@ -115,7 +186,7 @@ RUN \
         && \
     make install \
         && \
-#install boost library  for Windows.
+# install boost library for Windows.
     cd /tmp \
         && \
     wget https://dl.bintray.com/boostorg/release/1.67.0/source/boost_1_67_0.tar.gz \
@@ -144,19 +215,24 @@ RUN \
         && \
     ./bjam install --prefix=/usr/x86_64-w64-mingw32 \
         && \
-# clone VSM C++ SDK
+# clone VSM C++ SDK.
     cd /tmp \
         && \
-    git clone https://github.com/ugcs/vsm-cpp-sdk.git \
+    git clone https://github.com/sensyn-robotics/vsm-cpp-sdk.git \
         && \
     mkdir -p vsm-cpp-sdk/build \
         && \
     cd vsm-cpp-sdk/build \
         && \
 # generate Makefile for Windows.
+    ln -s /usr/local/include/google  /usr/x86_64-w64-mingw32/include/ \
+        && \
     cmake  \
+        -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON \
         -DCMAKE_TOOLCHAIN_FILE=/tmp/toolchain.mingw.cmake \
-        -DPROTOBUF_PROTOC_BINARY=/opt/vsm-sdk/linux/share/tools/protobuf_compiler \
+        -DPROTOBUF_INSTALL_DIR=/usr/local/bin/ \
+        -DPROTOBUF_LIBRARY=/usr/local/lib/ \
+        -DPROTOBUF_INCLUDE_DIR=/usr/x86_64-w64-mingw32/include \
         -DUGCS_INSTALL_DIR=/opt/vsm-sdk \
         -DCMAKE_INSTALL_PREFIX=/opt/vsm-sdk \
         -DCMAKE_BUILD_TYPE=Release \
@@ -164,45 +240,10 @@ RUN \
         -DCMAKE_CXX_FLAGS='-Wno-error=implicit-fallthrough' \
         .. \
         && \
-# build binaries but fails since wrong executable protobuf_compiler.
-    (cmake \
-        --build .  \
-        -- install  \
-        -j8 \
-    || true) \
-        && \
-    rm -f ./protobuf/protobuf_compiler.exe \
-        && \
-    ln -s /usr/local/bin/protobuf_compiler ./protobuf/protobuf_compiler.exe \
-        && \
-    touch ./protobuf/protobuf_compiler.exe \
-        && \
-# retry to build binaries and install them.
     cmake \
         --build .  \
         -- install  \
         -j1 \
-        && \
-# google test
-    wget https://github.com/google/googletest/archive/release-1.8.1.tar.gz \
-        && \
-    tar -xvf release-1.8.1.tar.gz \
-        && \
-    cd googletest-release-1.8.1/ \
-        && \
-    mkdir build \
-        && \
-    cd build \
-        && \
-    cmake .. \
-        && \
-    make \
-        && \
-    mv ../googletest/include/gtest/ /usr/local/include/ \
-        && \
-    mv ../googlemock/include/gmock/ /usr/local/include/ \
-        && \
-    mv googlemock /usr/lib/ \
         && \
 # Cleanup
     cd /tmp \
@@ -210,8 +251,8 @@ RUN \
     rm -rf * \
         && \
     apt remove -y \
-        gcc \
         automake \
+        autoconf \
         pkg-config \
         && \
     apt clean \
