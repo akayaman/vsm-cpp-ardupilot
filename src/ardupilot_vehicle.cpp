@@ -905,7 +905,6 @@ Ardupilot_vehicle::Start_rc_override()
         rc_override = mavlink::Pld_rc_channels_override::Create();
         (*rc_override)->target_system = real_system_id;
         (*rc_override)->target_component = real_component_id;
-        LOG_INFO("Ardupilot_vehicle::Start_rc_override component ID : %d", real_component_id);
         rc_override_timer = Timer_processor::Get_instance()->Create_timer(
             RC_OVERRIDE_PERIOD,
             Make_callback(&Ardupilot_vehicle::Send_rc_override_timer, Shared_from_this()),
@@ -4007,7 +4006,6 @@ Ardupilot_vehicle::Get_home_location()
         auto cmd_long = mavlink::Pld_command_long::Create();
         (*cmd_long)->target_system = real_system_id;
         (*cmd_long)->target_component = real_component_id;
-        LOG_INFO("Ardupilot_vehicle::Get_home_location component ID : %d", real_component_id);
         (*cmd_long)->command = mavlink::MAV_CMD_GET_HOME_POSITION;
         Send_message(*cmd_long);
     } else {
@@ -4595,7 +4593,6 @@ void Ardupilot_vehicle::Initialize_telemetry() {
         mavlink::Pld_request_data_stream msg;
         msg->target_system = real_system_id;
         msg->target_component = real_component_id;
-        LOG_INFO("Ardupilot_vehicle::Initialize_telemetry component ID : %d", real_component_id);
         msg->req_stream_id = it->first;
 
         std::string key = "vehicle.ardupilot.telemetry_rate." + it->second;
@@ -4613,6 +4610,7 @@ void Ardupilot_vehicle::Initialize_telemetry() {
         Send_message(msg);
         Send_message(msg);
     }
+
     // We are counting 6 messages as telemetry:
     // SYS_STATUS, GLOBAL_POSITION_INT, ATTITUDE, VFR_HUD, GPS_RAW_INT, ALTITUDE
     expected_telemetry_rate = telemetry_rate_hz * 6;

@@ -70,7 +70,7 @@ RUN \
 # clone VSM C++ SDK
     cd /tmp \
         && \
-    git clone https://github.com/sensyn-robotics/vsm-cpp-sdk.git \
+    git clone https://github.com/ugcs/vsm-cpp-sdk.git \
         && \
     mkdir -p vsm-cpp-sdk/build \
         && \

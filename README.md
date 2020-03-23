@@ -90,3 +90,17 @@ rm -f system.tgz vsm-sdk.tgz
 "${workspaceFolder}/build/include/vsm",
 "${workspaceFolder}/build/include/system"
 ```
+
+# Update git sub-modules
+
+```
+git submodule foreach git pull origin master
+```
+
+# The links to MAVLink
+
+* [Messages](https://mavlink.io/en/messages/common.html)
+* [Mission Protocol](https://mavlink.io/en/services/mission.html)
+* [Parameter Protocol](https://mavlink.io/en/services/parameter.html)
+* [Packet Serialization](https://mavlink.io/en/guide/serialization.html)
+
