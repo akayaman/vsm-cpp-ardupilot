@@ -111,6 +111,13 @@ Ardupilot_vehicle::On_enable()
         &Ardupilot_vehicle::On_adsb_vehicle,
         this);
 
+    if (custom_payload.enable) {
+        common_handlers.Register_mavlink_handler<mavlink::MESSAGE_ID::V2_EXTENSION>(
+            &Ardupilot_vehicle::On_v2_extension,
+            this,
+            custom_payload.component_id, custom_payload.system_id);
+    }
+
     common_handlers.Register_mavlink_handler<mavlink::sph::MESSAGE_ID::PARAM_STR_VALUE, mavlink::sph::Extension>(
         &Ardupilot_vehicle::On_string_parameter,
         this);
@@ -203,6 +210,26 @@ Ardupilot_vehicle::On_enable()
     t_target_latitude->Set_timeout(2);
     t_target_longitude->Set_timeout(2);
 
+    if (custom_payload.enable) {
+        obsolete_gpr = Add_subsystem(proto::Subsystem_type::SUBSYSTEM_TYPE_GPR);
+        for (auto &payload_subsystem : payload_subsystems) {
+            payload_subsystem->subsystem = Add_subsystem(proto::Subsystem_type::SUBSYSTEM_TYPE_GPR);
+            auto& payload_command = payload_subsystem->c_payload_command;
+
+            payload_command = payload_subsystem->subsystem->Add_command("payload_command", false);
+            payload_command->Add_parameter("command", proto::FIELD_SEMANTIC_STRING);
+
+            payload_command->Set_available();
+            payload_command->Set_enabled();
+
+#define ADD_T(x, y) payload_subsystem->t_##x = payload_subsystem->subsystem->Add_telemetry(#x, y)
+            ADD_T(payload_status_b64, proto::FIELD_SEMANTIC_STRING);
+            ADD_T(payload_data_b64,   proto::FIELD_SEMANTIC_STRING);
+            ADD_T(payload_value_b64,  proto::FIELD_SEMANTIC_STRING);
+#undef ADD_T
+        }
+    }
+
     Set_parameters_from_properties("vehicle.ardupilot.parameter");
 }
 
@@ -234,6 +261,29 @@ Ardupilot_vehicle::Verify_parameter(const std::string& name, float value, mavlin
     // Old code is above, may be we remove it in the future.
     type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
     return true;
+}
+
+mavlink::Payload_base::Ptr
+Ardupilot_vehicle::Prepare_v2_custom_payload_message(const std::vector<uint8_t> &commandBytes) {
+    ASSERT(custom_payload.enable);
+
+    auto cmd_v2 = mavlink::Pld_v2_extension::Create();
+
+    (*cmd_v2)->target_system = custom_payload.system_id;
+    (*cmd_v2)->target_component = custom_payload.component_id;
+    (*cmd_v2)->target_network = custom_payload.network;
+
+    auto &message_size_cell = (*cmd_v2)->payload[0];
+    auto maxAllowedSize = std::min(sizeof((*cmd_v2)->payload) - 1, size_t(std::numeric_limits<uint8_t>::max()));
+    if (commandBytes.size() > maxAllowedSize) {
+        throw std::invalid_argument("Can't pack too long v2 message for custom payload onboard computer: "
+                                    "max allowed size is " + std::to_string(maxAllowedSize) +
+                                    ", but " + std::to_string(commandBytes.size()) + " required");
+    }
+    message_size_cell = static_cast<uint8_t>(commandBytes.size());
+    memcpy(&(*cmd_v2)->payload[1], commandBytes.data(), commandBytes.size());
+
+    return std::move(cmd_v2);
 }
 
 void
@@ -565,6 +615,65 @@ Ardupilot_vehicle::On_adsb_vehicle(
 }
 
 void
+Ardupilot_vehicle::On_v2_extension(
+        ugcs::vsm::mavlink::Message<mavlink::MESSAGE_ID::V2_EXTENSION>::Ptr message)
+{
+    ASSERT(custom_payload.enable);
+    using namespace Protocol::Modern;
+
+    if (message->Get_sender_system_id() != custom_payload.system_id ||
+            message->Get_sender_component_id() != custom_payload.component_id) {
+        // Ignore messages from unknown senders
+        return;
+    }
+
+    auto &contents = message->payload->payload;
+    size_t length = contents[0];
+    if (length > sizeof(message->payload->payload) - 1) {
+        // Ignore messages with invalid length
+        LOG_WARN("Invalid length in V2_EXTENSION message received from custom payload onboard computer");
+        return;
+    }
+
+    auto begin = &contents[1];
+    PayloadByteArray payload(begin, begin + length);
+
+    Onboard::OnboardMessage onboardMessage(payload);
+    custom_payload_dispatcher.handle(onboardMessage, [](Onboard::MessageId, uint64_t) {
+        // Do nothing to handle pong
+    }, [this](Onboard::MessageId, const Payload::CompletePayload& completePayload) {
+        auto it = std::find_if(std::begin(payload_subsystems), std::end(payload_subsystems),
+            [&completePayload](PayloadSubsystem* payload_subsystem) {
+                return payload_subsystem->payloadId == completePayload.payloadId();
+            });
+        if (it == std::end(payload_subsystems))
+            return;
+
+        auto &payload_subsystem = **it;
+        auto data = Logic::base64_encode(completePayload.data().data(),
+                                         completePayload.data().size());
+
+        switch (completePayload.type()) {
+        case Payload::MessageId::PayloadData:
+            payload_subsystem.t_payload_data_b64->Set_value(data);
+            break;
+        case Payload::MessageId::PayloadStatus:
+            payload_subsystem.t_payload_status_b64->Set_value(data);
+            break;
+        case Payload::MessageId::PayloadValue:
+            payload_subsystem.t_payload_value_b64->Set_value(data);
+            break;
+        default:
+            // Ignore all other switch options
+            break;
+        }
+
+        Commit_to_ucs();
+    });
+
+}
+
+void
 Ardupilot_vehicle::On_mission_item(ugcs::vsm::mavlink::Pld_mission_item mi)
 {
     if (mi->seq == 0) {
@@ -613,7 +722,7 @@ Ardupilot_vehicle::On_home_position(
 void
 Ardupilot_vehicle::Report_home_location(double lat, double lon, double alt)
 {
-    if (home_location.latitude == lat || home_location.longitude == lon || home_location.altitude == alt) {
+    if (home_location.latitude == lat && home_location.longitude == lon && home_location.altitude == alt) {
         return;
     }
 
@@ -919,6 +1028,31 @@ Ardupilot_vehicle::Vehicle_command_act::Stop_camera_series()
 }
 
 void
+Ardupilot_vehicle::Vehicle_command_act::Process_payload_command(PayloadSubsystem &payload_subsystem, const Property_list &params)
+{
+    ASSERT(ardu_vehicle.custom_payload.enable);
+
+    using namespace Protocol::Modern;
+    std::string command;
+    if (params.Get_value("command", command)) {
+        auto data = Logic::base64_decode(command);
+        auto completePayload = ardu_vehicle.custom_payload_dispatcher
+                .createCompletePayload(Payload::MessageId::PayloadCommand,
+                                       payload_subsystem.payloadId,
+                                       data);
+        auto dataToSend = ardu_vehicle.custom_payload_dispatcher
+                .prepareDataForSend(completePayload, Onboard::MessageId::CommandMessage);
+        for (auto &commandBytes : dataToSend) {
+            auto cmd_v2 = ardu_vehicle.Prepare_v2_custom_payload_message(commandBytes);
+            Send_message(*cmd_v2);
+        }
+        Disable_success();
+    } else {
+        VSM_EXCEPTION(Invalid_param_exception, "Unsupported payload command");
+    }
+}
+
+void
 Ardupilot_vehicle::Vehicle_command_act::Send_next_command()
 {
     cmd_messages.pop_front();
@@ -1169,6 +1303,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
             VEHICLE_LOG_INF(vehicle, "COMMAND %s", vehicle.Dump_command(vsm_cmd).c_str());
         }
 
+        PayloadSubsystem** it;
         auto params = cmd->Build_parameter_list(vsm_cmd);
         if (cmd == vehicle.c_adsb_set_mode) {
             Process_adsb_set_mode(params);
@@ -1226,6 +1361,13 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
             Process_set_poi(params);
         } else if (cmd == ardu_vehicle.c_mission_clear) {
             Process_mission_clear();
+        } else if (ardu_vehicle.custom_payload.enable && (it = std::find_if(
+                std::begin(ardu_vehicle.payload_subsystems),
+                std::end(ardu_vehicle.payload_subsystems),
+                [&cmd](PayloadSubsystem* payload_subsystem) {
+                    return cmd == payload_subsystem->c_payload_command;
+                })) != std::end(ardu_vehicle.payload_subsystems)) {
+            Process_payload_command(**it, params);
         }
     }
     command_count = cmd_messages.size();
@@ -2298,6 +2440,7 @@ Ardupilot_vehicle::Task_upload::Preprocess_mission(const proto::Device_command& 
     }
 
     bool takeoff_present = false;
+    bool set_home_present = false;
 
     // Prepare_takeoff_mission uses this feature.
     current_route_command_index = 0;
@@ -2316,6 +2459,9 @@ Ardupilot_vehicle::Task_upload::Preprocess_mission(const proto::Device_command& 
             vehicle.current_command_map.Set_current_command(current_route_command_index);
             auto params = cmd->Build_parameter_list(vsm_scmd);
             if (cmd == vehicle.c_set_home) {
+                if (takeoff_present) {
+                    VSM_EXCEPTION(Invalid_param_exception, "SET_HOME must appear before any WP");
+                }
                 float alt;
                 if (params.Get_value("altitude_amsl", alt)) {
                     if (ardu_vehicle.send_home_position_as_mav_cmd) {
@@ -2336,17 +2482,35 @@ Ardupilot_vehicle::Task_upload::Preprocess_mission(const proto::Device_command& 
 
                 // Set home as first mission item. This makes sure HL is set on each mission execution.
                 Prepare_set_home(params);
-
-                if (takeoff_present) {
-                    VSM_EXCEPTION(Invalid_param_exception, "SET_HOME must appear before any WP");
-                }
+                set_home_present = true;
             } else if (cmd == vehicle.c_takeoff_mission) {
+                if (!set_home_present) {
+                    // If HL is not specified we must populate the 0 WPt with something.
+                    // First WP data in this case.
+                    // Newer Ardu versions 3.4+ ignores this.
+                    // For older ardupilots it will move HL to first WP.
+                    auto mi = Create_mission_item_with_coords(params);
+                    (*mi)->command = mavlink::MAV_CMD_NAV_WAYPOINT;
+                    Add_mission_item(mi);
+                    set_home_present = true;
+                }
                 takeoff_present = true;
             } else if (cmd == vehicle.c_set_parameter) {
                 // For now used only by arduplane params ("LANDING_FLARE_TIME" and friends)
                 Prepare_set_parameters(params);
             } else if (cmd == vehicle.c_move) {
+                if (!set_home_present) {
+                    // If HL is not specified we must populate the 0 WPt with something.
+                    // First WP data in this case.
+                    // Newer Ardu versions 3.4+ ignores this.
+                    // For older ardupilots it will move HL to first WP.
+                    auto mi = Create_mission_item_with_coords(params);
+                    (*mi)->command = mavlink::MAV_CMD_NAV_WAYPOINT;
+                    Add_mission_item(mi);
+                    set_home_present = true;
+                }
                 takeoff_present = true;
+                last_move_idx = i;
             }
         } else {
             VSM_EXCEPTION(Invalid_param_exception, "Unregistered route item %d", vsm_scmd.command_id());
@@ -2479,7 +2643,7 @@ void
 Ardupilot_vehicle::Task_upload::Task_atributes_uploaded(bool success, std::string error_msg)
 {
     if (success) {
-        if (ardu_vehicle.send_home_position_as_mav_cmd) {
+        if (ardu_vehicle.send_home_position_as_mav_cmd && hl_params.size()) {
             vehicle.do_commands.Disable();
             vehicle.do_commands.Set_next_action(
                     Activity::Make_next_action(
@@ -2510,9 +2674,6 @@ Ardupilot_vehicle::Task_upload::Task_commands_sent(bool success, std::string)
         // invalidate current home location and timer handler will retrieve it again.
         ardu_vehicle.home_location.longitude = 0;
         ardu_vehicle.home_location.latitude = 0;
-
-        // Invalidate the current mission_id.
-        vehicle.t_current_mission_id->Set_value_na();
 
         vehicle.Report_progress(ucs_request, (command_count + param_count) / total_count);
 
@@ -2707,7 +2868,7 @@ Ardupilot_vehicle::Task_upload::Prepare_mission(const proto::Device_command& vsm
                 Prepare_takeoff_mission(params);
                 takeoff_present = true;
             }
-            Prepare_move(params);
+            Prepare_move(params, i == last_move_idx);
         } else if (cmd == vehicle.c_set_speed) {
             Prepare_change_speed(params);
         } else if (cmd == vehicle.c_wait) {
@@ -2769,7 +2930,7 @@ Ardupilot_vehicle::Task_upload::Prepare_mission(const proto::Device_command& vsm
         param->param_value = f;
         VEHICLE_LOG_INF(vehicle, "Writing mission hash=%08X", vehicle.current_command_map.Get_route_id());
         task_attributes.push_back(param);
-   }
+    }
 }
 
 void
@@ -2777,7 +2938,6 @@ Ardupilot_vehicle::Task_upload::Prepare_task_attributes(const Property_list& par
 {
     mavlink::Pld_param_set param;
     Fill_target_ids(param);
-    int fs_value;
 
     if ( vehicle.Is_copter() ||
          vehicle.Get_vehicle_type() == proto::VEHICLE_TYPE_FIXED_WING ||
@@ -2789,8 +2949,10 @@ Ardupilot_vehicle::Task_upload::Prepare_task_attributes(const Property_list& par
         if (    vehicle.t_altitude_amsl->Get_value(current_alt)
             &&  vehicle.t_is_armed->Get_value(armed)
             &&  !armed
-            &&  ardu_vehicle.gnd_alt_offset_allow)
+            &&  ardu_vehicle.gnd_alt_offset_allow
+            &&  hl_params.size())
         {
+            // Vehicle on the ground and mission has HL specified and it is allowed to change GND_ALT_OFFSET
             param->param_id = "GND_ALT_OFFSET";
             param->param_type = mavlink::MAV_PARAM_TYPE::MAV_PARAM_TYPE_REAL32;
             if (ardu_vehicle.set_ground_alt_offset && ardu_vehicle.current_alt_offset) {
@@ -2800,7 +2962,6 @@ Ardupilot_vehicle::Task_upload::Prepare_task_attributes(const Property_list& par
                 // reset calibration
                 param->param_value = 0;
             }
-            param->param_value = (home_altitude - current_alt) + *ardu_vehicle.current_alt_offset;
             task_attributes.push_back(param);
         }
 
@@ -2814,6 +2975,7 @@ Ardupilot_vehicle::Task_upload::Prepare_task_attributes(const Property_list& par
         }
 
         if (vehicle.Is_copter()) {
+            int fs_value;
             // Set copter specific stuff
             if (params.Get_value("low_battery_action", fs_value)) {
                 /* Battery failsafe. */
@@ -3058,11 +3220,15 @@ Ardupilot_vehicle::Task_upload::Stop_camera_series()
 }
 
 void
-Ardupilot_vehicle::Task_upload::Prepare_move(const Property_list& params)
+Ardupilot_vehicle::Task_upload::Prepare_move(const Property_list& params, bool is_last)
 {
     Stop_camera_series();
 
     auto mi = Build_wp_mission_item(params);
+    if (is_last) {
+        // Force last WP to straight.
+        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
+    }
     if (last_move_params) {
         auto from = Wgs84_position(Create_geodetic_tuple(*last_move_params));
         auto to = Wgs84_position(Create_geodetic_tuple(params));
@@ -3698,10 +3864,11 @@ Ardupilot_vehicle::Task_upload::Build_wp_mission_item(const Property_list& param
         case proto::TURN_TYPE_SPLINE:
             (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_SPLINE_WAYPOINT;
             break;
+        case proto::TURN_TYPE_STRAIGHT:
+            (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
+            break;
         default:
             VEHICLE_LOG_WRN(vehicle, "Invalid turn type: %d, defaulting to 'straight'.", tt);
-            /* no break */
-        case proto::TURN_TYPE_STRAIGHT:
             (*mi)->command = mavlink::MAV_CMD::MAV_CMD_NAV_WAYPOINT;
             break;
         }
@@ -4036,6 +4203,41 @@ Ardupilot_vehicle::Configure_common()
     updateConfig("vehicle.fq1150.camera.shooting.delay", optionalConfig.camera.shootingDelay);
     updateConfig("vehicle.fq1150.camera.recording.pwm", optionalConfig.camera.startRecordingPwm);
     updateConfig("vehicle.fq1150.camera.stop.pwm", optionalConfig.camera.stopPwm);
+
+#define CUSTOM_PAYLOAD_PREFIX "vehicle.ardupilot.custom_payload"
+    if (props->Exists(CUSTOM_PAYLOAD_PREFIX ".enable")) {
+        auto yes = props->Get(CUSTOM_PAYLOAD_PREFIX ".enable");
+
+        if (yes == "no") {
+            custom_payload.enable = false;
+        } else if (yes == "yes") {
+            custom_payload.enable = true;
+
+#define READ_PARAMETER(parameter, min) \
+            { \
+            auto parameter = props->Get_int(CUSTOM_PAYLOAD_PREFIX ".onboard." #parameter); \
+            auto parameter##_max = std::numeric_limits<decltype(custom_payload.parameter)>::max(); \
+            auto parameter##_min = min; \
+            if (parameter > parameter##_max || parameter < parameter##_min) { \
+                VSM_EXCEPTION(Exception, "Invalid custom payload onboard " #parameter ": %d provided, must be in [%d, %d] range", \
+                              parameter, parameter##_min, parameter##_max); \
+            } \
+            custom_payload.parameter = static_cast<uint8_t>(parameter); \
+            }
+
+            READ_PARAMETER(system_id, 1);
+            READ_PARAMETER(component_id, 1);
+
+            auto network_configuration_option = CUSTOM_PAYLOAD_PREFIX ".onboard.network";
+            if (props->Exists(network_configuration_option)) {
+                READ_PARAMETER(network, 0);
+            }
+
+        } else {
+            VEHICLE_LOG_ERR((*this), "Invalid value '%s' for custom_payload.enable", yes.c_str());
+        }
+    }
+#undef CUSTOM_PAYLOAD_PREFIX
 }
 
 void
@@ -4111,7 +4313,6 @@ Ardupilot_vehicle::Configure_real_vehicle()
                 VEHICLE_LOG_INF((*this), "Route download is disabled.");
             }
         }
-
     }
 }
 
@@ -4421,6 +4622,7 @@ void Ardupilot_vehicle::Initialize_telemetry() {
         Send_message(msg);
         Send_message(msg);
     }
+
     // We are counting 6 messages as telemetry:
     // SYS_STATUS, GLOBAL_POSITION_INT, ATTITUDE, VFR_HUD, GPS_RAW_INT, ALTITUDE
     expected_telemetry_rate = telemetry_rate_hz * 6;
