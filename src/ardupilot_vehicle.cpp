@@ -3,6 +3,7 @@
 // See LICENSE file for license details.
 
 #include <ardupilot_vehicle.h>
+#include <algorithm>
 
 using namespace ugcs::vsm;
 
@@ -10,6 +11,9 @@ constexpr std::chrono::milliseconds Ardupilot_vehicle::RC_OVERRIDE_PERIOD;
 constexpr std::chrono::milliseconds Ardupilot_vehicle::RC_OVERRIDE_TIMEOUT;
 constexpr std::chrono::seconds Ardupilot_vehicle::HL_POLLING_PERIOD;
 constexpr std::chrono::seconds Ardupilot_vehicle::ADSB_VEHICLE_TIMEOUT;
+
+constexpr int Ardupilot_vehicle::MAV_CMD_DO_GRIPPER;
+constexpr int Ardupilot_vehicle::GRIPPER_ACTION_RELEASE;
 
 // Constructor for command processor.
 Ardupilot_vehicle::Ardupilot_vehicle(proto::Vehicle_type type):
@@ -55,6 +59,7 @@ Ardupilot_vehicle::On_enable()
 
     // Get parameter values.
     Mavlink_vehicle::On_enable();
+
     read_version.version_handler = Read_version::Make_version_handler(
         &Ardupilot_vehicle::On_autopilot_version,
         Shared_from_this());
@@ -1212,7 +1217,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
         } else if (cmd == vehicle.c_guided) {
             Process_guided();
         } else if (cmd == vehicle.c_camera_trigger_command) {
-            Process_camera_trigger();
+            Process_camera_trigger(params);
         } else if (cmd == vehicle.c_direct_vehicle_control) {
             Process_direct_vehicle_control(params);
         } else if (cmd == vehicle.c_write_parameter) {
@@ -1630,9 +1635,16 @@ Ardupilot_vehicle::Vehicle_command_act::Process_set_servo(const Property_list& p
     Fill_target_ids(*cmd_long);
     params.Get_value("servo_id", servo_id);
     params.Get_value("pwm", pwm);
-    (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_SERVO;
-    (*cmd_long)->param1 = servo_id;
-    (*cmd_long)->param2 = pwm;
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    if (servo_id == veh.optionalConfig.gripper.servoId && pwm == veh.optionalConfig.gripper.pwm) {
+        (*cmd_long)->command = MAV_CMD_DO_GRIPPER;
+        (*cmd_long)->param1 = veh.optionalConfig.gripper.index;
+        (*cmd_long)->param2 = GRIPPER_ACTION_RELEASE;
+    } else {
+        (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_SERVO;
+        (*cmd_long)->param1 = servo_id;
+        (*cmd_long)->param2 = pwm;
+    }
     cmd_messages.emplace_back(cmd_long);
 }
 
@@ -2079,19 +2091,39 @@ Ardupilot_vehicle::Vehicle_command_act::Process_rth()
 }
 
 void
-Ardupilot_vehicle::Vehicle_command_act::Process_camera_trigger()
+Ardupilot_vehicle::Vehicle_command_act::Process_camera_trigger(const ugcs::vsm::Property_list& params)
 {
     auto cmd_long = mavlink::Pld_command_long::Create();
     Fill_target_ids(*cmd_long);
-    if (ardu_vehicle.camera_servo_idx == -1) {
-        (*cmd_long)->command = mavlink::MAV_CMD_DO_DIGICAM_CONTROL;
-        (*cmd_long)->param5 = 1;
-    } else {
-        (*cmd_long)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-        (*cmd_long)->param1 = ardu_vehicle.camera_servo_idx;
-        (*cmd_long)->param2 = ardu_vehicle.camera_servo_pwm;
-        (*cmd_long)->param3 = 1;  // do it once
-        (*cmd_long)->param4 = ardu_vehicle.camera_servo_time;
+
+    int state;
+    params.Get_value("state", state);
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    switch (state) {
+    case proto::CAMERA_COMMAND_TRIGGER_STATE_SINGLE_SHOT:
+        {
+            auto c = mavlink::Pld_command_long::Create();
+            Fill_target_ids(*c);
+            veh.Set_servo(c, veh.optionalConfig.camera.startShootingPwm);
+            cmd_messages.emplace_back(c);
+        }
+        {
+            auto c = mavlink::Pld_command_long::Create();
+            Fill_target_ids(*c);
+            veh.Set_shoot_delay(c);
+            cmd_messages.emplace_back(c);
+        }
+        veh.Set_servo(cmd_long, veh.optionalConfig.camera.stopPwm);
+        break;
+    case proto::CAMERA_COMMAND_TRIGGER_STATE_VIDEO_START:
+        veh.Set_servo(cmd_long, veh.optionalConfig.camera.startRecordingPwm);
+        break;
+    case proto::CAMERA_COMMAND_TRIGGER_STATE_VIDEO_STOP:
+        veh.Set_servo(cmd_long, veh.optionalConfig.camera.stopPwm);
+        break;
+    default:
+        VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
+        return;
     }
     cmd_messages.emplace_back(cmd_long);
 }
@@ -3159,13 +3191,21 @@ Ardupilot_vehicle::Task_upload::Prepare_landing(const Property_list& params)
 void
 Ardupilot_vehicle::Task_upload::Prepare_set_servo(const Property_list& params)
 {
-    int tmp;
     auto mi = Create_mission_item();
-    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
-    params.Get_value("servo_id", tmp);
-    (*mi)->param1 = tmp;
-    params.Get_value("pwm", tmp);
-    (*mi)->param2 = tmp;
+    int servo_id;
+    int pwm;
+    params.Get_value("servo_id", servo_id);
+    params.Get_value("pwm", pwm);
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    if (servo_id == veh.optionalConfig.gripper.servoId && pwm == veh.optionalConfig.gripper.pwm) {
+        (*mi)->command = MAV_CMD_DO_GRIPPER;
+        (*mi)->param1 = veh.optionalConfig.gripper.index;
+        (*mi)->param2 = GRIPPER_ACTION_RELEASE;
+    } else {
+        (*mi)->command = mavlink::MAV_CMD_DO_SET_SERVO;
+        (*mi)->param1 = servo_id;
+        (*mi)->param2 = pwm;
+    }
     Add_mission_item(mi);
 }
 
@@ -3199,13 +3239,48 @@ Ardupilot_vehicle::Task_upload::Prepare_payload_control(const Property_list& par
     auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_MOUNT_CONTROL;
     params.Get_value("tilt", tmp);
-    (*mi)->param1 = tmp * 180.0 / M_PI;
+    (*mi)->param1 = -tmp * 180.0 / M_PI;
     params.Get_value("roll", tmp);
     (*mi)->param2 = tmp * 180.0 / M_PI;
     params.Get_value("yaw", tmp);
-    (*mi)->param3 = tmp * 180.0 / M_PI;
+    const auto yaw = tmp * 180.0 / M_PI;
+    (*mi)->param3 = yaw < 180 ? std::min(yaw, 175.0) : std::max(yaw - 360, -175.0);
     (*mi)->z = mavlink::MAV_MOUNT_MODE::MAV_MOUNT_MODE_MAVLINK_TARGETING;
     Add_mission_item(mi);
+
+    if (params.Get_value("zoom_level", tmp)) {
+        const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+        // set zoom level normal.
+        {
+            auto mi = Create_mission_item();
+            veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomOut);
+            Add_mission_item(mi);
+        }
+        {
+            auto mi = Create_mission_item();
+            veh.Set_delay(mi, veh.optionalConfig.zoom.resetTime);
+            Add_mission_item(mi);
+        }
+
+        // set zoom level the required value.
+        if (tmp > 1) {
+            {
+                auto mi = Create_mission_item();
+                veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomIn);
+                Add_mission_item(mi);
+            }
+            {
+                auto mi = Create_mission_item();
+                veh.Set_delay(mi, veh.optionalConfig.zoom.ratio * tmp);
+                Add_mission_item(mi);
+            }
+            {
+                auto mi = Create_mission_item();
+                veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomStop);
+                Add_mission_item(mi);
+            }
+        }
+    }
 }
 
 void
@@ -3355,27 +3430,33 @@ Ardupilot_vehicle::Task_upload::Prepare_camera_trigger(const Property_list& para
     int state;
     params.Get_value("state", state);
 
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    switch (state) {
+    case proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO:
+        Add_camera_trigger_item();
+        break;
+    case proto::CAMERA_MISSION_TRIGGER_STATE_ON:
+        {
+            auto mi = Create_mission_item();
+            veh.Set_servo(mi, veh.optionalConfig.camera.startRecordingPwm);
+            Add_mission_item(mi);
+        }
+        break;
+    case proto::CAMERA_MISSION_TRIGGER_STATE_OFF:
+        {
+            auto mi = Create_mission_item();
+            veh.Set_servo(mi, veh.optionalConfig.camera.stopPwm);
+            Add_mission_item(mi);
+        }
+        break;
+    default:
+        VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
+        return;
+    }
     if (state != proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO &&
         state != proto::CAMERA_MISSION_TRIGGER_STATE_SERIAL_PHOTO) {
         VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
         return;
-    }
-    if (state == proto::CAMERA_MISSION_TRIGGER_STATE_SINGLE_PHOTO) {
-        Add_camera_trigger_item();
-    } else {
-        if (ardu_vehicle.camera_servo_idx == -1) {
-            VEHICLE_LOG_WRN(vehicle, "Command repeat_trigger ignored.");
-            return;
-        }
-        auto mi = Create_mission_item();
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-        (*mi)->param1 = ardu_vehicle.camera_servo_idx;
-        (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
-        (*mi)->param3 = 32767;    // infinity packed in signed short.
-        (*mi)->param4 = ardu_vehicle.camera_servo_time;
-        camera_series_by_time_active = true;
-        camera_series_by_time_active_in_wp = true;
-        Add_mission_item(mi);
     }
 }
 
@@ -3571,18 +3652,22 @@ Ardupilot_vehicle::Task_upload::Build_heading_mission_item(
 void
 Ardupilot_vehicle::Task_upload::Add_camera_trigger_item()
 {
-    auto mi = Create_mission_item();
-    if (ardu_vehicle.camera_servo_idx == -1) {
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_DIGICAM_CONTROL;
-        (*mi)->x = 1;
-    } else {
-        (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_REPEAT_SERVO;
-        (*mi)->param1 = ardu_vehicle.camera_servo_idx;
-        (*mi)->param2 = ardu_vehicle.camera_servo_pwm;
-        (*mi)->param3 = 1;  // do it once
-        (*mi)->param4 = ardu_vehicle.camera_servo_time;
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    {
+        auto mi = Create_mission_item();
+        veh.Set_servo(mi, veh.optionalConfig.camera.startShootingPwm);
+        Add_mission_item(mi);
     }
-    Add_mission_item(mi);
+    {
+        auto mi = Create_mission_item();
+        veh.Set_shoot_delay(mi);
+        Add_mission_item(mi);
+    }
+    {
+        auto mi = Create_mission_item();
+        veh.Set_servo(mi, veh.optionalConfig.camera.stopPwm);
+        Add_mission_item(mi);
+    }
 }
 
 mavlink::Pld_mission_item::Ptr
@@ -3936,6 +4021,21 @@ Ardupilot_vehicle::Configure_common()
             VEHICLE_LOG_INF((*this), "ignore_speed_in_route is off.");
         }
     }
+
+    updateConfig("vehicle.fq1150.gripper.servo_id", optionalConfig.gripper.servoId);
+    updateConfig("vehicle.fq1150.gripper.pwm", optionalConfig.gripper.pwm);
+    updateConfig("vehicle.fq1150.gripper.index", optionalConfig.gripper.index);
+    updateConfig("vehicle.fq1150.zoom.servo_id", optionalConfig.zoom.servoId);
+    updateConfig("vehicle.fq1150.zoom.in.pwm", optionalConfig.zoom.zoomIn);
+    updateConfig("vehicle.fq1150.zoom.stop.pwm", optionalConfig.zoom.zoomStop);
+    updateConfig("vehicle.fq1150.zoom.out.pwm", optionalConfig.zoom.zoomOut);
+    updateConfig("vehicle.fq1150.zoom.reset_time", optionalConfig.zoom.resetTime);
+    updateConfig("vehicle.fq1150.zoom.ratio", optionalConfig.zoom.ratio);
+    updateConfig("vehicle.fq1150.camera.servo_id", optionalConfig.camera.servoId);
+    updateConfig("vehicle.fq1150.camera.shooting.pwm", optionalConfig.camera.startShootingPwm);
+    updateConfig("vehicle.fq1150.camera.shooting.delay", optionalConfig.camera.shootingDelay);
+    updateConfig("vehicle.fq1150.camera.recording.pwm", optionalConfig.camera.startRecordingPwm);
+    updateConfig("vehicle.fq1150.camera.stop.pwm", optionalConfig.camera.stopPwm);
 }
 
 void
