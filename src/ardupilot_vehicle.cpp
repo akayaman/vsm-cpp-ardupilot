@@ -3,6 +3,7 @@
 // See LICENSE file for license details.
 
 #include <ardupilot_vehicle.h>
+#include <algorithm>
 
 using namespace ugcs::vsm;
 
@@ -3356,13 +3357,21 @@ Ardupilot_vehicle::Task_upload::Prepare_landing(const Property_list& params)
 void
 Ardupilot_vehicle::Task_upload::Prepare_set_servo(const Property_list& params)
 {
-    int tmp;
     auto mi = Create_mission_item();
-    (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_SET_SERVO;
-    params.Get_value("servo_id", tmp);
-    (*mi)->param1 = tmp;
-    params.Get_value("pwm", tmp);
-    (*mi)->param2 = tmp;
+    int servo_id;
+    int pwm;
+    params.Get_value("servo_id", servo_id);
+    params.Get_value("pwm", pwm);
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    if (servo_id == veh.optionalConfig.gripper.servoId && pwm == veh.optionalConfig.gripper.pwm) {
+        (*mi)->command = MAV_CMD_DO_GRIPPER;
+        (*mi)->param1 = veh.optionalConfig.gripper.index;
+        (*mi)->param2 = GRIPPER_ACTION_RELEASE;
+    } else {
+        (*mi)->command = mavlink::MAV_CMD_DO_SET_SERVO;
+        (*mi)->param1 = servo_id;
+        (*mi)->param2 = pwm;
+    }
     Add_mission_item(mi);
 }
 
@@ -3396,17 +3405,18 @@ Ardupilot_vehicle::Task_upload::Prepare_payload_control(const Property_list& par
     auto mi = Create_mission_item();
     (*mi)->command = mavlink::MAV_CMD::MAV_CMD_DO_MOUNT_CONTROL;
     params.Get_value("tilt", tmp);
-    (*mi)->param1 = tmp * 180.0 / M_PI;
+    (*mi)->param1 = -tmp * 180.0 / M_PI;
     params.Get_value("roll", tmp);
     (*mi)->param2 = tmp * 180.0 / M_PI;
     params.Get_value("yaw", tmp);
-    (*mi)->param3 = tmp * 180.0 / M_PI;
+    const auto yaw = tmp * 180.0 / M_PI;
+    (*mi)->param3 = yaw < 180 ? std::min(yaw, 175.0) : std::max(yaw - 360, -175.0);
     (*mi)->z = mavlink::MAV_MOUNT_MODE::MAV_MOUNT_MODE_MAVLINK_TARGETING;
     Add_mission_item(mi);
 
     if (params.Get_value("zoom_level", tmp)) {
         const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
-        // set zoom level zero.
+        // set zoom level normal.
         {
             auto mi = Create_mission_item();
             veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomOut);
@@ -3419,20 +3429,22 @@ Ardupilot_vehicle::Task_upload::Prepare_payload_control(const Property_list& par
         }
 
         // set zoom level the required value.
-        {
-            auto mi = Create_mission_item();
-            veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomIn);
-            Add_mission_item(mi);
-        }
-        {
-            auto mi = Create_mission_item();
-            veh.Set_delay(mi, veh.optionalConfig.zoom.ratio * tmp);
-            Add_mission_item(mi);
-        }
-        {
-            auto mi = Create_mission_item();
-            veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomStop);
-            Add_mission_item(mi);
+        if (tmp > 1) {
+            {
+                auto mi = Create_mission_item();
+                veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomIn);
+                Add_mission_item(mi);
+            }
+            {
+                auto mi = Create_mission_item();
+                veh.Set_delay(mi, veh.optionalConfig.zoom.ratio * tmp);
+                Add_mission_item(mi);
+            }
+            {
+                auto mi = Create_mission_item();
+                veh.Set_zoom(mi, veh.optionalConfig.zoom.zoomStop);
+                Add_mission_item(mi);
+            }
         }
     }
 }

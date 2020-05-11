@@ -933,11 +933,11 @@ private:
 
         struct Zoom {
             int servoId = 12;
-            int zoomIn = 1800;
+            int zoomIn = 1685;
             int zoomStop = 1514;
-            int zoomOut = 1200;
-            int resetTime = 3;
-            double ratio = 0.3;
+            int zoomOut = 1050;
+            int resetTime = 4;
+            double ratio = 1;
         } zoom;
 
         struct Camera {
