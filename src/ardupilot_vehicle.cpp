@@ -1294,7 +1294,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
 
     cmd_messages.clear();
 
-    bool lazyExecution = false;
+    bool lazy_execution = false;
     for (int c = 0; ucs_request && c < ucs_request->request.device_commands_size(); c++) {
         auto &vsm_cmd = ucs_request->request.device_commands(c);
         auto cmd = vehicle.Get_command(vsm_cmd.command_id());
@@ -1335,7 +1335,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
         } else if (cmd == vehicle.c_pause) {
             Process_pause();
         } else if (cmd == vehicle.c_auto) {
-            lazyExecution = true;
+            lazy_execution = true;
             Process_auto();
         } else if (cmd == vehicle.c_manual) {
             Process_manual();
@@ -1373,7 +1373,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
         }
     }
     command_count = cmd_messages.size();
-    if (!lazyExecution) {
+    if (!lazy_execution) {
         Try();
     } else {
         if (lazy_timer) {
