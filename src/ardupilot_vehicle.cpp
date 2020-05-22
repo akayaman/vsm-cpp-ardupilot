@@ -4,6 +4,8 @@
 
 #include <ardupilot_vehicle.h>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 using namespace ugcs::vsm;
 
@@ -1294,6 +1296,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
 
     cmd_messages.clear();
 
+    bool lazyExecution = false;
     for (int c = 0; ucs_request && c < ucs_request->request.device_commands_size(); c++) {
         auto &vsm_cmd = ucs_request->request.device_commands(c);
         auto cmd = vehicle.Get_command(vsm_cmd.command_id());
@@ -1334,6 +1337,7 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
         } else if (cmd == vehicle.c_pause) {
             Process_pause();
         } else if (cmd == vehicle.c_auto) {
+            lazyExecution = true;
             Process_auto();
         } else if (cmd == vehicle.c_manual) {
             Process_manual();
@@ -1371,7 +1375,20 @@ Ardupilot_vehicle::Vehicle_command_act::Enable()
         }
     }
     command_count = cmd_messages.size();
-    Try();
+    if (!lazyExecution) {
+        Try();
+    } else {
+        if (lazy_timer) {
+            lazy_timer->Cancel();
+        }
+
+        int delay = 10;
+        dynamic_cast<Ardupilot_vehicle&>(vehicle).updateConfig("vehicle.ec101.auto.wait", delay);
+        lazy_timer = Timer_processor::Get_instance()->Create_timer(
+                std::chrono::seconds(delay),
+                Make_callback(&Vehicle_command_act::Try, this),
+                vehicle.Get_completion_ctx());
+    }
 }
 
 void
@@ -2280,6 +2297,10 @@ Ardupilot_vehicle::Vehicle_command_act::On_disable()
     if (timer) {
         timer->Cancel();
         timer = nullptr;
+    }
+    if (lazy_timer) {
+        lazy_timer->Cancel();
+        lazy_timer = nullptr;
     }
 }
 
@@ -4189,20 +4210,20 @@ Ardupilot_vehicle::Configure_common()
         }
     }
 
-    updateConfig("vehicle.fq1150.gripper.servo_id", optionalConfig.gripper.servoId);
-    updateConfig("vehicle.fq1150.gripper.pwm", optionalConfig.gripper.pwm);
-    updateConfig("vehicle.fq1150.gripper.index", optionalConfig.gripper.index);
-    updateConfig("vehicle.fq1150.zoom.servo_id", optionalConfig.zoom.servoId);
-    updateConfig("vehicle.fq1150.zoom.in.pwm", optionalConfig.zoom.zoomIn);
-    updateConfig("vehicle.fq1150.zoom.stop.pwm", optionalConfig.zoom.zoomStop);
-    updateConfig("vehicle.fq1150.zoom.out.pwm", optionalConfig.zoom.zoomOut);
-    updateConfig("vehicle.fq1150.zoom.reset_time", optionalConfig.zoom.resetTime);
-    updateConfig("vehicle.fq1150.zoom.ratio", optionalConfig.zoom.ratio);
-    updateConfig("vehicle.fq1150.camera.servo_id", optionalConfig.camera.servoId);
-    updateConfig("vehicle.fq1150.camera.shooting.pwm", optionalConfig.camera.startShootingPwm);
-    updateConfig("vehicle.fq1150.camera.shooting.delay", optionalConfig.camera.shootingDelay);
-    updateConfig("vehicle.fq1150.camera.recording.pwm", optionalConfig.camera.startRecordingPwm);
-    updateConfig("vehicle.fq1150.camera.stop.pwm", optionalConfig.camera.stopPwm);
+    updateConfig("vehicle.ec101.gripper.servo_id", optionalConfig.gripper.servoId);
+    updateConfig("vehicle.ec101.gripper.pwm", optionalConfig.gripper.pwm);
+    updateConfig("vehicle.ec101.gripper.index", optionalConfig.gripper.index);
+    updateConfig("vehicle.ec101.zoom.servo_id", optionalConfig.zoom.servoId);
+    updateConfig("vehicle.ec101.zoom.in.pwm", optionalConfig.zoom.zoomIn);
+    updateConfig("vehicle.ec101.zoom.stop.pwm", optionalConfig.zoom.zoomStop);
+    updateConfig("vehicle.ec101.zoom.out.pwm", optionalConfig.zoom.zoomOut);
+    updateConfig("vehicle.ec101.zoom.reset_time", optionalConfig.zoom.resetTime);
+    updateConfig("vehicle.ec101.zoom.ratio", optionalConfig.zoom.ratio);
+    updateConfig("vehicle.ec101.camera.servo_id", optionalConfig.camera.servoId);
+    updateConfig("vehicle.ec101.camera.shooting.pwm", optionalConfig.camera.startShootingPwm);
+    updateConfig("vehicle.ec101.camera.shooting.delay", optionalConfig.camera.shootingDelay);
+    updateConfig("vehicle.ec101.camera.recording.pwm", optionalConfig.camera.startRecordingPwm);
+    updateConfig("vehicle.ec101.camera.stop.pwm", optionalConfig.camera.stopPwm);
 
 #define CUSTOM_PAYLOAD_PREFIX "vehicle.ardupilot.custom_payload"
     if (props->Exists(CUSTOM_PAYLOAD_PREFIX ".enable")) {

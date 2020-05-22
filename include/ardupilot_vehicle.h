@@ -194,6 +194,9 @@ public:
         /** Current timeout to use when scheduling timer. */
         std::chrono::milliseconds current_timeout;
 
+        /** Timer for lazy execution */
+        ugcs::vsm::Timer_processor::Timer::Ptr lazy_timer;
+
         /** check if point is inside polygon.
          *  Algorithm was taken from ardupilot cause we have to check if the returning point
          *  for geofence is outside polygon exactly as ardupilot does.
