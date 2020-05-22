@@ -4,8 +4,6 @@
 
 #include <ardupilot_vehicle.h>
 #include <algorithm>
-#include <chrono>
-#include <thread>
 
 using namespace ugcs::vsm;
 
