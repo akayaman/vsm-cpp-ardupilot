@@ -3877,6 +3877,8 @@ Ardupilot_vehicle::Task_upload::Build_wp_mission_item(const Property_list& param
 
     int tt;
     if (ardu_vehicle.Is_copter() && params.Get_value("turn_type", tt) && last_move_params) {
+        dynamic_cast<Ardupilot_vehicle&>(vehicle).updateConfig("vehicle.ec101.turn_type", tt);
+
         // Check turn_type only for copter and non-first waypoints.
         // (If first WP is spline, autopilot effectively ignores it)
         switch (tt) {
