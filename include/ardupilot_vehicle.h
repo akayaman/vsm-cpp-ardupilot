@@ -948,7 +948,7 @@ private:
             int startShootingPwm = 1500;
             int startRecordingPwm = 1900;
             int stopPwm = 1100;
-            int shootingDelay = 3;
+            int shootingDelay = 6;
         } camera;
     } optionalConfig;
 
