@@ -1797,12 +1797,17 @@ Ardupilot_vehicle::Vehicle_command_act::Process_set_servo(const Property_list& p
         (*cmd_long)->command = MAV_CMD_DO_GRIPPER;
         (*cmd_long)->param1 = veh.optionalConfig.gripper.index;
         (*cmd_long)->param2 = GRIPPER_ACTION_RELEASE;
+        cmd_messages.emplace_back(cmd_long);
+
+        auto delay_cmd = mavlink::Pld_command_long::Create();
+        veh.Set_delay(delay_cmd, veh.optionalConfig.gripper.delay);
+        cmd_messages.emplace_back(delay_cmd);
     } else {
         (*cmd_long)->command = mavlink::MAV_CMD_DO_SET_SERVO;
         (*cmd_long)->param1 = servo_id;
         (*cmd_long)->param2 = pwm;
+        cmd_messages.emplace_back(cmd_long);
     }
-    cmd_messages.emplace_back(cmd_long);
 }
 
 void
@@ -3386,12 +3391,17 @@ Ardupilot_vehicle::Task_upload::Prepare_set_servo(const Property_list& params)
         (*mi)->command = MAV_CMD_DO_GRIPPER;
         (*mi)->param1 = veh.optionalConfig.gripper.index;
         (*mi)->param2 = GRIPPER_ACTION_RELEASE;
+        Add_mission_item(mi);
+
+        auto delay_mi = Create_mission_item();
+        veh.Set_delay(delay_mi, veh.optionalConfig.gripper.delay);
+        Add_mission_item(delay_mi);
     } else {
         (*mi)->command = mavlink::MAV_CMD_DO_SET_SERVO;
         (*mi)->param1 = servo_id;
         (*mi)->param2 = pwm;
+        Add_mission_item(mi);
     }
-    Add_mission_item(mi);
 }
 
 void
@@ -4211,6 +4221,7 @@ Ardupilot_vehicle::Configure_common()
     updateConfig("vehicle.ec101.gripper.servo_id", optionalConfig.gripper.servoId);
     updateConfig("vehicle.ec101.gripper.pwm", optionalConfig.gripper.pwm);
     updateConfig("vehicle.ec101.gripper.index", optionalConfig.gripper.index);
+    updateConfig("vehicle.ec101.gripper.delay", optionalConfig.gripper.delay);
     updateConfig("vehicle.ec101.zoom.servo_id", optionalConfig.zoom.servoId);
     updateConfig("vehicle.ec101.zoom.in.pwm", optionalConfig.zoom.zoomIn);
     updateConfig("vehicle.ec101.zoom.stop.pwm", optionalConfig.zoom.zoomStop);
