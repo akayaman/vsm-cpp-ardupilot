@@ -932,6 +932,7 @@ private:
             int servoId = -99999;
             int pwm = -99999;
             int index = 1;
+            int delay = 10;
         } gripper;
 
         struct Zoom {
