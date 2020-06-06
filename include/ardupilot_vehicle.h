@@ -331,6 +331,9 @@ public:
          * @return Created mission item. */
 
         void
+        Prepare_delayed_move(const ugcs::vsm::Optional<ugcs::vsm::Property_list>& params, int delaySeconds);
+
+        void
         Prepare_move(const ugcs::vsm::Property_list&, bool is_last = false);
 
         void
@@ -951,6 +954,15 @@ private:
             int stopPwm = 1100;
             int shootingDelay = 6;
         } camera;
+
+        struct ActionDelay {
+            int yaw = 0;
+            int speed = 3;
+            int servo = 10;
+            int mount = 5;
+            int zoom = 1;
+            int shoot = 2;
+        } delay;
     } optionalConfig;
 
     template <typename T> void Set_servo(T item, int pwm) const
