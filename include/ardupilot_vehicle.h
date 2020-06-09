@@ -935,7 +935,7 @@ private:
             int servoId = -99999;
             int pwm = -99999;
             int index = 1;
-            int delay = 10;
+            int delay = 0;
         } gripper;
 
         struct Zoom {
@@ -952,16 +952,16 @@ private:
             int startShootingPwm = 1500;
             int startRecordingPwm = 1900;
             int stopPwm = 1100;
-            int shootingDelay = 6;
+            int shootingDelay = 3;
         } camera;
 
         struct ActionDelay {
             int yaw = 0;
-            int speed = 3;
-            int servo = 10;
-            int mount = 5;
+            int speed = 0;
+            int servo = 0;
+            int mount = 1;
             int zoom = 1;
-            int shoot = 2;
+            int shoot = 3;
         } delay;
     } optionalConfig;
 
