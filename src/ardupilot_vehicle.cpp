@@ -3243,6 +3243,22 @@ Ardupilot_vehicle::Task_upload::Stop_camera_series()
     camera_series_by_time_active_in_wp = false;
 }
 
+
+void
+Ardupilot_vehicle::Task_upload::Prepare_delayed_move(const ugcs::vsm::Optional<ugcs::vsm::Property_list>& params, int delaySeconds)
+{
+    if (!params) {
+        VEHICLE_LOG_ERR(vehicle, "current position is not determined.");
+        return;
+    } else if (delaySeconds <= 0) {
+        VEHICLE_LOG_ERR(vehicle, "delay time is zero.");
+    }
+
+    auto mi = Build_wp_mission_item(*params);
+    (*mi)->param1 = delaySeconds;
+    Add_mission_item(mi);
+}
+
 void
 Ardupilot_vehicle::Task_upload::Prepare_move(const Property_list& params, bool is_last)
 {
@@ -3291,6 +3307,9 @@ Ardupilot_vehicle::Task_upload::Prepare_move(const Property_list& params, bool i
                 // Autoheading is copter specific.
                 VEHICLE_LOG_INF(vehicle, "Set Autoheading to %f", current_heading);
                 Add_mission_item(Build_heading_mission_item(current_heading));
+
+                const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+                Prepare_delayed_move(last_move_params, veh.optionalConfig.delay.yaw);
             }
         }
     }
@@ -3392,15 +3411,13 @@ Ardupilot_vehicle::Task_upload::Prepare_set_servo(const Property_list& params)
         (*mi)->param1 = veh.optionalConfig.gripper.index;
         (*mi)->param2 = GRIPPER_ACTION_RELEASE;
         Add_mission_item(mi);
-
-        auto delay_mi = Create_mission_item();
-        veh.Set_delay(delay_mi, veh.optionalConfig.gripper.delay);
-        Add_mission_item(delay_mi);
+        Prepare_delayed_move(last_move_params, veh.optionalConfig.gripper.delay);
     } else {
         (*mi)->command = mavlink::MAV_CMD_DO_SET_SERVO;
         (*mi)->param1 = servo_id;
         (*mi)->param2 = pwm;
         Add_mission_item(mi);
+        Prepare_delayed_move(last_move_params, veh.optionalConfig.delay.servo);
     }
 }
 
@@ -3443,6 +3460,9 @@ Ardupilot_vehicle::Task_upload::Prepare_payload_control(const Property_list& par
     (*mi)->z = mavlink::MAV_MOUNT_MODE::MAV_MOUNT_MODE_MAVLINK_TARGETING;
     Add_mission_item(mi);
 
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    Prepare_delayed_move(last_move_params, veh.optionalConfig.delay.mount);
+
     if (params.Get_value("zoom_level", tmp)) {
         const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
         // set zoom level normal.
@@ -3476,6 +3496,7 @@ Ardupilot_vehicle::Task_upload::Prepare_payload_control(const Property_list& par
             }
         }
     }
+    Prepare_delayed_move(last_move_params, veh.optionalConfig.delay.zoom);
 }
 
 void
@@ -3521,6 +3542,9 @@ Ardupilot_vehicle::Task_upload::Prepare_change_speed(const Property_list& params
 
     (*mi)->param3 = -1; /* Throttle no change. */
     Add_mission_item(mi);
+
+    const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+    Prepare_delayed_move(last_move_params, veh.optionalConfig.delay.speed);
 }
 
 void
@@ -3568,6 +3592,10 @@ Ardupilot_vehicle::Task_upload::Prepare_heading(const Property_list& params)
         float heading;
         params.Get_value("heading", heading);
         Add_mission_item(Build_heading_mission_item(heading));
+
+        const auto& veh = dynamic_cast<const Ardupilot_vehicle&>(vehicle);
+        Prepare_delayed_move(last_move_params, veh.optionalConfig.delay.yaw);
+
         current_heading = heading;
         current_mission_heading = heading;
         // Heading action terminates current POI.
@@ -3653,6 +3681,7 @@ Ardupilot_vehicle::Task_upload::Prepare_camera_trigger(const Property_list& para
         VEHICLE_LOG_WRN(vehicle, "Unsupported camera trigger state %d ignored.", state);
         return;
     }
+    Prepare_delayed_move(last_move_params, veh.optionalConfig.delay.shoot);
 }
 
 void
@@ -4235,6 +4264,12 @@ Ardupilot_vehicle::Configure_common()
     updateConfig("vehicle.ec101.camera.shooting.delay", optionalConfig.camera.shootingDelay);
     updateConfig("vehicle.ec101.camera.recording.pwm", optionalConfig.camera.startRecordingPwm);
     updateConfig("vehicle.ec101.camera.stop.pwm", optionalConfig.camera.stopPwm);
+    updateConfig("vehicle.ec101.delay.servo", optionalConfig.delay.servo);
+    updateConfig("vehicle.ec101.delay.mount", optionalConfig.delay.mount);
+    updateConfig("vehicle.ec101.delay.zoom", optionalConfig.delay.zoom);
+    updateConfig("vehicle.ec101.delay.speed", optionalConfig.delay.speed);
+    updateConfig("vehicle.ec101.delay.yaw", optionalConfig.delay.yaw);
+    updateConfig("vehicle.ec101.delay.shoot", optionalConfig.delay.shoot);
 
 #define CUSTOM_PAYLOAD_PREFIX "vehicle.ardupilot.custom_payload"
     if (props->Exists(CUSTOM_PAYLOAD_PREFIX ".enable")) {
